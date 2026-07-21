@@ -1,0 +1,7 @@
+.env
+.env.*
+node_modules/
+runs/
+*.log
+.DS_Store
+backend-before-*.mjs

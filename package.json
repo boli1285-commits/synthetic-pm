@@ -1,0 +1,20 @@
+{
+  "name": "synthetic-pm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node backend.mjs",
+    "check": "node --check backend.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@browserbasehq/sdk": "2.16.0",
+    "dotenv": "17.4.2",
+    "openai": "6.48.0",
+    "playwright-core": "1.61.1",
+    "resend": "6.17.2"
+  }
+}

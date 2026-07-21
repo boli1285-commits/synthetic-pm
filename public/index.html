@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Synthetic PM — An agent that explores your competitor's product</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #EEF0EA;
+    --paper-raised: #FFFFFF;
+    --ink: #14181B;
+    --muted: #5B6259;
+    --line: #CBD0C4;
+    --accent: #E8502B;
+    --confirm: #2F6A4C;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .mono {
+    font-family: 'Space Mono', 'Courier New', monospace;
+  }
+
+  a { color: inherit; }
+
+  .wrap {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 0 32px;
+  }
+
+  /* ---------- NAV ---------- */
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: rgba(238, 240, 234, 0.92);
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--line);
+  }
+  nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 20px 0;
+  }
+  .logo {
+    font-family: 'Space Mono', monospace;
+    font-weight: 700;
+    font-size: 15px;
+    letter-spacing: 0.04em;
+  }
+  .logo span { color: var(--accent); }
+  .nav-links {
+    display: flex;
+    gap: 32px;
+    font-family: 'Space Mono', monospace;
+    font-size: 13px;
+    letter-spacing: 0.02em;
+  }
+  .nav-links a { text-decoration: none; color: var(--muted); transition: color 0.15s; }
+  .nav-links a:hover { color: var(--ink); }
+  .nav-cta {
+    font-family: 'Space Mono', monospace;
+    font-size: 13px;
+    background: var(--ink);
+    color: var(--paper);
+    padding: 10px 18px;
+    border-radius: 3px;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .nav-mobile-hide { display: flex; }
+  @media (max-width: 720px) {
+    .nav-mobile-hide { display: none; }
+  }
+
+  /* ---------- HERO ---------- */
+  .hero {
+    padding: 90px 0 60px;
+    display: grid;
+    grid-template-columns: 1.1fr 0.9fr;
+    gap: 56px;
+    align-items: center;
+  }
+  @media (max-width: 860px) {
+    .hero { grid-template-columns: 1fr; padding: 56px 0 40px; }
+  }
+  .eyebrow {
+    font-family: 'Space Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    color: var(--accent);
+    margin-bottom: 18px;
+  }
+  .eyebrow::before { content: "// "; color: var(--muted); }
+  h1 {
+    font-family: 'Space Mono', monospace;
+    font-weight: 700;
+    font-size: clamp(28px, 4vw, 42px);
+    line-height: 1.28;
+    letter-spacing: -0.01em;
+    margin-bottom: 22px;
+  }
+  .hero p.lede {
+    color: var(--muted);
+    font-size: 18px;
+    max-width: 48ch;
+    margin-bottom: 32px;
+  }
+  .cta-row { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+  .btn-primary {
+    font-family: 'Space Mono', monospace;
+    font-size: 14px;
+    font-weight: 700;
+    background: var(--accent);
+    color: #fff;
+    padding: 15px 26px;
+    border-radius: 3px;
+    text-decoration: none;
+    display: inline-block;
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+  .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(232, 80, 43, 0.25); }
+  .link-quiet {
+    font-family: 'Space Mono', monospace;
+    font-size: 13px;
+    color: var(--muted);
+    text-decoration: none;
+    border-bottom: 1px dashed var(--muted);
+    padding-bottom: 2px;
+  }
+
+  /* ---------- HERO MAP SIGNATURE ---------- */
+  .map-box {
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 22px;
+    position: relative;
+  }
+  .map-box .map-label {
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+    margin-bottom: 14px;
+    display: flex;
+    justify-content: space-between;
+  }
+  .map-svg { width: 100%; height: auto; display: block; }
+  .map-node circle { fill: var(--paper-raised); stroke: var(--ink); stroke-width: 1.6; }
+  .map-node text {
+    font-family: 'Space Mono', monospace;
+    font-size: 9px;
+    fill: var(--ink);
+  }
+  .map-edge {
+    fill: none;
+    stroke: var(--line);
+    stroke-width: 1.6;
+    stroke-dasharray: 4 4;
+  }
+  .map-marker {
+    fill: var(--accent);
+    offset-rotate: 0deg;
+    animation: travel 7s linear infinite;
+  }
+  @keyframes travel {
+    0%   { offset-distance: 0%; opacity: 0; }
+    4%   { opacity: 1; }
+    46%  { offset-distance: 50%; opacity: 1; }
+    50%  { opacity: 0; }
+    50.1%{ offset-distance: 50%; }
+    54%  { opacity: 1; }
+    96%  { offset-distance: 100%; opacity: 1;}
+    100% { offset-distance: 100%; opacity: 0; }
+  }
+  .path-a { offset-path: path("M 30,140 C 90,60 150,60 210,110"); }
+  .path-b { offset-path: path("M 210,110 C 250,150 260,190 310,175"); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .map-marker { animation: none; opacity: 1; offset-distance: 0%; }
+  }
+
+  /* ---------- SECTION SHELL ---------- */
+  section { padding: 64px 0; border-top: 1px solid var(--line); }
+  .section-head { max-width: 60ch; margin-bottom: 40px; }
+  .section-eyebrow {
+    font-family: 'Space Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+  h2 {
+    font-family: 'Space Mono', monospace;
+    font-weight: 700;
+    font-size: clamp(22px, 3vw, 28px);
+    line-height: 1.35;
+  }
+  .reveal { opacity: 0; transform: translateY(14px); transition: opacity 0.6s ease, transform 0.6s ease; }
+  .reveal.in { opacity: 1; transform: translateY(0); }
+
+  /* ---------- PROBLEM ---------- */
+  .problem-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 40px;
+    align-items: start;
+  }
+  @media (max-width: 760px) { .problem-grid { grid-template-columns: 1fr; } }
+  .stat-block {
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 28px;
+  }
+  .stat-num {
+    font-family: 'Space Mono', monospace;
+    font-weight: 700;
+    font-size: 40px;
+    color: var(--ink);
+  }
+  .stat-cap { font-family: 'Space Mono', monospace; font-size: 12px; color: var(--muted); margin-top: 6px; letter-spacing: 0.02em; }
+
+  /* ---------- HOW IT WORKS ---------- */
+  .steps { display: flex; flex-direction: column; }
+  .step {
+    display: grid;
+    grid-template-columns: 64px 1fr;
+    gap: 24px;
+    padding: 26px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .step:last-child { border-bottom: none; }
+  .step-num {
+    font-family: 'Space Mono', monospace;
+    font-weight: 700;
+    font-size: 22px;
+    color: var(--line);
+  }
+  .step h3 {
+    font-family: 'Source Serif 4', serif;
+    font-weight: 600;
+    font-size: 19px;
+    margin-bottom: 6px;
+  }
+  .step p { color: var(--muted); max-width: 62ch; }
+  .step-tag {
+    display: inline-block;
+    font-family: 'Space Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    color: var(--confirm);
+    border: 1px solid var(--confirm);
+    border-radius: 3px;
+    padding: 2px 7px;
+    margin-left: 10px;
+    vertical-align: middle;
+    transform: translateY(-1px);
+  }
+
+  /* ---------- DELIVERABLES ---------- */
+  .deliv-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 24px;
+  }
+  @media (max-width: 760px) { .deliv-grid { grid-template-columns: 1fr; } }
+  .deliv-card {
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .deliv-card .mockup {
+    height: 150px;
+    background:
+      repeating-linear-gradient(0deg, transparent, transparent 22px, rgba(20,24,27,0.05) 22px, rgba(20,24,27,0.05) 23px),
+      var(--paper);
+    border-bottom: 1px solid var(--line);
+    position: relative;
+    padding: 16px;
+  }
+  .mockup .bar { height: 8px; background: var(--line); border-radius: 2px; margin-bottom: 8px; }
+  .mockup .bar.short { width: 40%; }
+  .mockup .bar.tag { background: var(--accent); opacity: 0.5; width: 22%; }
+  .deliv-card .body { padding: 20px; }
+  .deliv-card h3 { font-family: 'Source Serif 4', serif; font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+  .deliv-card p { color: var(--muted); font-size: 15px; }
+  .placeholder-note {
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    background: rgba(203, 208, 196, 0.35);
+    border: 1px dashed var(--line);
+    border-radius: 4px;
+    padding: 14px 16px;
+    margin-top: 24px;
+  }
+
+  /* ---------- WHO IT'S FOR ---------- */
+  .persona-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+  }
+  @media (max-width: 900px) { .persona-grid { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 600px) { .persona-grid { grid-template-columns: 1fr; } }
+  .persona-card {
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 28px;
+  }
+  .persona-tag {
+    display: inline-block;
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    padding: 3px 9px;
+    margin-bottom: 16px;
+  }
+  .persona-card h3 { font-family: 'Source Serif 4', serif; font-size: 20px; font-weight: 600; margin-bottom: 10px; }
+  .persona-card p { color: var(--muted); }
+
+  /* ---------- TRUST ---------- */
+  .trust-panel {
+    background: var(--ink);
+    color: var(--paper);
+    border-radius: 8px;
+    padding: 44px;
+  }
+  @media (max-width: 640px) { .trust-panel { padding: 28px; } }
+  .trust-panel h2 { color: var(--paper); }
+  .trust-panel .section-eyebrow { color: #9AA79C; }
+  .gate-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    padding: 18px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.12);
+  }
+  .gate-row:last-child { border-bottom: none; }
+  .gate-icon {
+    font-family: 'Space Mono', monospace;
+    font-size: 12px;
+    color: var(--ink);
+    background: var(--accent);
+    border-radius: 3px;
+    padding: 4px 8px;
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+  .gate-row p { color: #C7D0C6; font-size: 15px; }
+  .gate-row strong { color: #fff; }
+
+  /* ---------- CTA / FORM ---------- */
+  .cta-section {
+    text-align: center;
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 80px 32px;
+  }
+  .cta-section h2 { margin-bottom: 14px; }
+  .cta-section p { color: var(--muted); margin-bottom: 32px; }
+  form.apply {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    max-width: 520px;
+    margin: 0 auto;
+    text-align: left;
+  }
+  .field-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  @media (max-width: 520px) { .field-row { grid-template-columns: 1fr; } }
+  .field { display: flex; flex-direction: column; }
+  .field-label {
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 0.03em;
+    margin-bottom: 5px;
+  }
+  .field-label .optional { opacity: 0.6; }
+  form.apply input, form.apply select, form.apply textarea {
+    width: 100%;
+    font-family: 'Source Serif 4', serif;
+    font-size: 15px;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    background: var(--paper-raised);
+    color: var(--ink);
+  }
+  form.apply textarea { resize: vertical; }
+  form.apply input:focus, form.apply select:focus, form.apply textarea:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  form.apply button {
+    font-family: 'Space Mono', monospace;
+    font-size: 13px;
+    font-weight: 700;
+    background: var(--ink);
+    color: var(--paper);
+    border: none;
+    padding: 14px 20px;
+    border-radius: 3px;
+    cursor: pointer;
+    margin-top: 4px;
+  }
+  .form-note { font-family: 'Space Mono', monospace; font-size: 11px; color: var(--muted); margin-top: 14px; }
+
+  .whatsapp-float {
+    border-radius: 50%;
+    background: #25D366;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 14px rgba(37, 211, 102, 0.4);
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+    text-decoration: none;
+    flex-shrink: 0;
+    animation: pulse-whatsapp 2.2s infinite;
+  }
+  .whatsapp-float:hover {
+    transform: scale(1.08);
+    animation-play-state: paused;
+  }
+  @keyframes pulse-whatsapp {
+    0% { box-shadow: 0 4px 14px rgba(37, 211, 102, 0.4), 0 0 0 0 rgba(37, 211, 102, 0.55); }
+    70% { box-shadow: 0 4px 14px rgba(37, 211, 102, 0.4), 0 0 0 16px rgba(37, 211, 102, 0); }
+    100% { box-shadow: 0 4px 14px rgba(37, 211, 102, 0.4), 0 0 0 0 rgba(37, 211, 102, 0); }
+  }
+
+  footer {
+    border-top: 1px solid var(--line);
+    padding: 28px 0 40px;
+    font-family: 'Space Mono', monospace;
+    font-size: 12px;
+    color: var(--muted);
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <nav class="wrap">
+    <div class="logo">SYNTHETIC<span>_</span>PM</div>
+    <div class="nav-links nav-mobile-hide">
+      <a href="/how-it-works.html">How it works</a>
+      <a href="#who">Who it's for</a>
+      <a href="#trust">Trust &amp; safety</a>
+    </div>
+    <a href="/start" class="nav-cta">Try now</a>
+  </nav>
+</header>
+
+<main class="wrap">
+
+  <!-- ================= HERO ================= -->
+  <section class="hero" style="border-top:none; padding-top: 90px;">
+    <div>
+      <div class="eyebrow">COMPETITIVE INTELLIGENCE, AUTOMATED</div>
+      <h1>Competitive research, without the hours.</h1>
+      <p class="lede">An AI that explores any product — a competitor's, or your own — and reports back what it finds. No hours of clicking through it yourself.</p>
+      <div class="cta-row">
+        <a href="/start" class="btn-primary">Try now</a>
+        <a href="/how-it-works.html" class="link-quiet">See how it works ↓</a>
+      </div>
+    </div>
+    <div class="map-box">
+      <div class="map-label">
+        <span>LIVE_EXPLORATION.MAP</span>
+        <span>node_count: 6</span>
+      </div>
+      <svg class="map-svg" viewBox="0 0 340 220" xmlns="http://www.w3.org/2000/svg">
+        <path class="map-edge" d="M 30,140 C 90,60 150,60 210,110" />
+        <path class="map-edge" d="M 210,110 C 250,150 260,190 310,175" />
+        <path class="map-edge" d="M 30,140 C 10,180 40,205 90,200" />
+        <path class="map-edge" d="M 210,110 C 190,70 160,40 120,42" />
+        <circle class="map-marker" r="4" style="offset-path: path('M 30,140 C 90,60 150,60 210,110 C 250,150 260,190 310,175');" />
+        <g class="map-node"><circle cx="30" cy="140" r="17"/><text x="30" y="143" text-anchor="middle">IN</text></g>
+        <g class="map-node"><circle cx="210" cy="110" r="17"/><text x="210" y="113" text-anchor="middle">SEQ</text></g>
+        <g class="map-node"><circle cx="310" cy="175" r="17"/><text x="310" y="178" text-anchor="middle">CRM</text></g>
+        <g class="map-node"><circle cx="90" cy="200" r="17"/><text x="90" y="203" text-anchor="middle">SET</text></g>
+        <g class="map-node"><circle cx="120" cy="42" r="17"/><text x="120" y="45" text-anchor="middle">LDS</text></g>
+      </svg>
+    </div>
+  </section>
+
+  <!-- ================= WHO IT'S FOR ================= -->
+  <section id="who">
+    <div class="section-head reveal">
+      <div class="section-eyebrow">WHO THIS IS FOR</div>
+      <h2>Open to anyone — fastest payoff for three roles.</h2>
+    </div>
+    <div class="persona-grid reveal">
+      <div class="persona-card">
+        <div class="persona-tag">PRODUCT</div>
+        <h3>For product owners</h3>
+        <p>The real story on a competitor's onboarding, pricing, and feature depth — without losing an afternoon to it. Friction points come with real evidence, not a guess.</p>
+      </div>
+      <div class="persona-card">
+        <div class="persona-tag">DESIGN</div>
+        <h3>For designers</h3>
+        <p>A real component inventory and flow map for every screen — an actual starting point for your file. See how a pattern was solved before you design your own.</p>
+      </div>
+      <div class="persona-card">
+        <div class="persona-tag">FOUNDER</div>
+        <h3>For small business owners</h3>
+        <p>No product or design team of your own? Get a real read on your product — or a competitor's — without hiring anyone to do it.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= PROBLEM ================= -->
+  <section>
+    <div class="section-head reveal">
+      <div class="section-eyebrow">THE CURRENT STATE</div>
+      <h2>Manual teardown doesn't scale, so it barely happens.</h2>
+    </div>
+    <div class="problem-grid reveal">
+      <p>Understanding a product firsthand — a competitor's or your own — means hours of clicking through it yourself. It's the first thing that gets skipped when things get busy.</p>
+      <div class="stat-block">
+        <div class="stat-num">1–3<span style="font-size:20px;"> hrs</span></div>
+        <div class="stat-cap">// TYPICAL MANUAL TEARDOWN, PER PASS</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= HOW IT WORKS ================= -->
+  <section id="how">
+    <div class="section-head reveal">
+      <div class="section-eyebrow">THE PROCESS</div>
+      <h2>Five steps, in order, every time.</h2>
+    </div>
+    <div class="steps reveal">
+      <div class="step">
+        <div class="step-num">01</div>
+        <div>
+          <h3>Pick a target</h3>
+          <p>Yours or a competitor's — a URL is required, not just a name.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">02</div>
+        <div>
+          <h3>You and the agent sign in together<span class="step-tag">HUMAN-LED</span></h3>
+          <p>You handle the real login. The agent gets zero access until the account exists.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">03</div>
+        <div>
+          <h3>You watch the agent explore on its own</h3>
+          <p>The agent takes over from there — clicking, reading, mapping the product out live, in the same window.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">04</div>
+        <div>
+          <h3>You can steer the agent, or it'll ask<span class="step-tag">YOU DECIDE</span></h3>
+          <p>Point the agent at something specific any time. The agent will also ask when unsure, and pause for your OK before anything risky.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">05</div>
+        <div>
+          <h3>You get your report</h3>
+          <p>A structured write-up — every screen the agent found, and a real map of how they connect.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= DELIVERABLES ================= -->
+  <section>
+    <div class="section-head reveal">
+      <div class="section-eyebrow">WHAT COMES BACK</div>
+      <h2>A structured record, not a transcript.</h2>
+    </div>
+    <div class="deliv-grid reveal">
+      <div class="deliv-card">
+        <div class="mockup"><div class="bar" style="width:60%"></div><div class="bar short"></div><div class="bar tag"></div></div>
+        <div class="body">
+          <h3>Screen inventory</h3>
+          <p>Every screen it found — purpose, layout, real components.</p>
+        </div>
+      </div>
+      <div class="deliv-card">
+        <div class="mockup"><div class="bar" style="width:35%"></div><div class="bar" style="width:70%"></div><div class="bar short"></div></div>
+        <div class="body">
+          <h3>Navigation flow map</h3>
+          <p>How screens connect, as a real, traceable diagram.</p>
+        </div>
+      </div>
+      <div class="deliv-card">
+        <div class="mockup"><div class="bar" style="width:80%"></div><div class="bar tag"></div><div class="bar short"></div></div>
+        <div class="body">
+          <h3>Friction points, with evidence</h3>
+          <p>Each one tied to what actually happened on screen.</p>
+        </div>
+      </div>
+      <div class="deliv-card">
+        <div class="mockup"><div class="bar" style="width:50%"></div><div class="bar" style="width:50%"></div><div class="bar tag"></div></div>
+        <div class="body">
+          <h3>Positioning read</h3>
+          <p>What its design choices reveal — self-serve or sales-assisted, speed or control.</p>
+        </div>
+      </div>
+    </div>
+    <div class="placeholder-note reveal">
+      NOTE — illustrative mockups, not screenshots from a real run.
+    </div>
+  </section>
+
+  <!-- ================= TRUST ================= -->
+  <section id="trust">
+    <div class="trust-panel reveal">
+      <div class="section-eyebrow">TRUST &amp; SAFETY</div>
+      <h2>The agent doesn't decide what's risky. You do.</h2>
+      <div style="margin-top: 28px;">
+        <div class="gate-row">
+          <div class="gate-icon">GATE</div>
+          <p><strong>Every risky action pauses for approval</strong> — sending, connecting an account, payments, deletions. Proposed first, run only after you say yes.</p>
+        </div>
+        <div class="gate-row">
+          <div class="gate-icon">LOG</div>
+          <p><strong>Every run leaves a full record</strong> of what it saw and did.</p>
+        </div>
+        <div class="gate-row">
+          <div class="gate-icon">SEP</div>
+          <p><strong>Sign-in stays separate from exploration</strong> — a human handles credentials, always.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= CTA ================= -->
+  <section id="apply" style="border-top: none;">
+    <div class="cta-section reveal">
+      <div class="section-eyebrow" style="text-align:center;">GET STARTED</div>
+      <h2>Point the agent at any product. See what it finds.</h2>
+      <p>No sales call, no waitlist.</p>
+      <a href="/start" class="btn-primary" style="display:inline-block; text-decoration:none;">Try now</a>
+      <div class="form-note" style="margin-top:16px;">For questions, message us on WhatsApp →</div>
+    </div>
+  </section>
+
+</main>
+
+<div style="position:fixed; bottom:26px; right:26px; z-index:999; display:flex; align-items:center; gap:12px;">
+  <div style="background:#25D366; color:white; border-radius:999px; padding:11px 20px; font-family:'Space Mono',monospace; font-size:14px; font-weight:700; box-shadow:0 3px 12px rgba(0,0,0,0.2); white-space:nowrap;">Got questions?</div>
+  <a href="https://wa.me/16179590354?text=Hi!%20I%27d%20like%20to%20try%20Synthetic%20PM." class="whatsapp-float" target="_blank" rel="noopener" aria-label="Message on WhatsApp" style="width:80px; height:80px;">
+    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" style="width:38px; height:38px;">
+      <path d="M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9l-5 4v-4H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z" fill="white"/>
+    </svg>
+  </a>
+</div>
+
+<footer class="wrap">
+  <div>SYNTHETIC_PM</div>
+  <div style="display:flex; gap:18px; align-items:center;">
+    <a href="https://www.linkedin.com/in/boli1285/" target="_blank" rel="noopener" style="text-decoration:none; color:inherit;">LinkedIn</a>
+    <a href="https://x.com/boli1285" target="_blank" rel="noopener" style="text-decoration:none; color:inherit;">Twitter</a>
+    <span>Early access, not yet commercially available</span>
+  </div>
+</footer>
+
+<script>
+  const revealEls = document.querySelectorAll('.reveal');
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('in'); });
+  }, { threshold: 0.15 });
+  revealEls.forEach(el => io.observe(el));
+</script>
+
+</body>
+</html>

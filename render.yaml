@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: synthetic-pm
+    runtime: node
+    region: singapore
+    plan: starter
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: BROWSERBASE_API_KEY
+        sync: false
+      - key: BROWSERBASE_PROJECT_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5.6
+      - key: OPENAI_REASONING_EFFORT
+        value: high
+      - key: RESEND_API_KEY
+        sync: false
+      - key: NOTION_API_KEY
+        sync: false
+      - key: NOTION_PARENT_PAGE
+        sync: false
+      - key: BASE_URL
+        sync: false
+      - key: FROM_EMAIL
+        sync: false

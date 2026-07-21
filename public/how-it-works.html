@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>How it works — Synthetic PM</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #EEF0EA;
+    --paper-raised: #FFFFFF;
+    --ink: #14181B;
+    --muted: #5B6259;
+    --line: #CBD0C4;
+    --accent: #E8502B;
+    --confirm: #2F6A4C;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: 'Space Mono', 'Courier New', monospace; }
+  a { color: inherit; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 32px; }
+
+  header {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(238, 240, 234, 0.92);
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--line);
+  }
+  nav { display: flex; align-items: center; justify-content: space-between; padding: 20px 0; max-width: 1080px; margin: 0 auto; padding-left: 32px; padding-right: 32px; }
+  .logo { font-family: 'Space Mono', monospace; font-weight: 700; font-size: 15px; letter-spacing: 0.04em; }
+  .logo span { color: var(--accent); }
+  .nav-links { display: flex; gap: 32px; font-family: 'Space Mono', monospace; font-size: 13px; }
+  .nav-links a { text-decoration: none; color: var(--muted); transition: color 0.15s; }
+  .nav-links a:hover { color: var(--ink); }
+  .nav-mobile-hide { display: flex; }
+  @media (max-width: 720px) { .nav-mobile-hide { display: none; } }
+  .nav-cta {
+    font-family: 'Space Mono', monospace; font-size: 13px;
+    background: var(--ink); color: var(--paper);
+    padding: 10px 18px; border-radius: 3px; text-decoration: none; white-space: nowrap;
+  }
+
+  .page-hero { padding: 64px 0 40px; }
+  .eyebrow { font-family: 'Space Mono', monospace; font-size: 12px; letter-spacing: 0.14em; color: var(--accent); margin-bottom: 16px; }
+  .eyebrow::before { content: "// "; color: var(--muted); }
+  h1 { font-family: 'Space Mono', monospace; font-weight: 700; font-size: clamp(26px, 4vw, 36px); line-height: 1.3; margin-bottom: 18px; }
+  .page-hero p.lede { color: var(--muted); font-size: 18px; max-width: 60ch; }
+
+  .back-link { font-family: 'Space Mono', monospace; font-size: 13px; color: var(--muted); text-decoration: none; display: inline-block; margin-bottom: 28px; }
+  .back-link:hover { color: var(--ink); }
+
+  .stage {
+    border-top: 1px solid var(--line);
+    padding: 48px 0;
+    display: grid;
+    grid-template-columns: 90px 1fr;
+    gap: 28px;
+  }
+  @media (max-width: 640px) { .stage { grid-template-columns: 1fr; gap: 10px; } }
+  .stage-num { font-family: 'Space Mono', monospace; font-weight: 700; font-size: 32px; color: var(--line); }
+  .stage h2 { font-family: 'Source Serif 4', serif; font-weight: 600; font-size: 24px; margin-bottom: 12px; }
+  .stage p { color: var(--muted); max-width: 62ch; margin-bottom: 14px; }
+  .stage p:last-child { margin-bottom: 0; }
+  .stage-tag {
+    display: inline-block; font-family: 'Space Mono', monospace; font-size: 10px; letter-spacing: 0.06em;
+    color: var(--confirm); border: 1px solid var(--confirm); border-radius: 3px; padding: 2px 8px; margin-left: 10px; vertical-align: middle; transform: translateY(-2px);
+  }
+  .detail-box {
+    background: var(--paper-raised); border: 1px solid var(--line); border-radius: 6px;
+    padding: 18px 20px; margin-top: 14px;
+  }
+  .detail-box .label { font-family: 'Space Mono', monospace; font-size: 11px; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 8px; }
+  .detail-box p { color: var(--ink); margin: 0; }
+
+  .cta-section {
+    text-align: center;
+    max-width: 560px;
+    margin: 0 auto;
+    padding: 64px 32px 80px;
+  }
+  .cta-section h2 { font-family: 'Space Mono', monospace; font-weight: 700; font-size: 24px; margin-bottom: 14px; }
+  .cta-section p { color: var(--muted); margin-bottom: 28px; }
+  .btn-primary {
+    font-family: 'Space Mono', monospace; font-size: 14px; font-weight: 700;
+    background: var(--accent); color: #fff; padding: 15px 26px; border-radius: 3px; text-decoration: none; display: inline-block;
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+  .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(232, 80, 43, 0.25); }
+
+  .whatsapp-float {
+    border-radius: 50%;
+    background: #25D366;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 14px rgba(37, 211, 102, 0.4);
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+    text-decoration: none;
+    flex-shrink: 0;
+    animation: pulse-whatsapp 2.2s infinite;
+  }
+  .whatsapp-float:hover {
+    transform: scale(1.08);
+    animation-play-state: paused;
+  }
+  @keyframes pulse-whatsapp {
+    0% { box-shadow: 0 4px 14px rgba(37, 211, 102, 0.4), 0 0 0 0 rgba(37, 211, 102, 0.55); }
+    70% { box-shadow: 0 4px 14px rgba(37, 211, 102, 0.4), 0 0 0 16px rgba(37, 211, 102, 0); }
+    100% { box-shadow: 0 4px 14px rgba(37, 211, 102, 0.4), 0 0 0 0 rgba(37, 211, 102, 0); }
+  }
+
+  footer {
+    border-top: 1px solid var(--line); padding: 28px 0 40px;
+    font-family: 'Space Mono', monospace; font-size: 12px; color: var(--muted);
+    display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px;
+    max-width: 1080px; margin: 0 auto; padding-left: 32px; padding-right: 32px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <nav>
+    <a href="/" class="logo">SYNTHETIC<span>_</span>PM</a>
+    <div class="nav-links nav-mobile-hide">
+      <a href="/#who">Who it's for</a>
+      <a href="/#trust">Trust &amp; safety</a>
+    </div>
+    <a href="/start" class="nav-cta">Try now</a>
+  </nav>
+</header>
+
+<main class="wrap">
+
+  <div class="page-hero">
+    <a href="/" class="back-link">← Back home</a>
+    <div class="eyebrow">HOW IT WORKS</div>
+    <h1>Five steps. Every time. No shortcuts.</h1>
+    <p class="lede">Here's exactly what happens, in order — from picking a target to getting your report back.</p>
+  </div>
+
+  <div class="stage">
+    <div class="stage-num">01</div>
+    <div>
+      <h2>Pick a target</h2>
+      <p>Know what you want explored — your own product, or a competitor's. The agent can't guess this part for you — come with the actual URL, not just a name.</p>
+    </div>
+  </div>
+
+  <div class="stage">
+    <div class="stage-num">02</div>
+    <div>
+      <h2>You and the agent sign in together <span class="stage-tag">HUMAN-LED</span></h2>
+      <p>You handle the real login yourself — filling in the email, the password, clicking through any verification — right in the shared browser window. The agent isn't watching yet, and has no access at all until the account genuinely exists.</p>
+      <div class="detail-box">
+        <div class="label mono">WHY IT WORKS THIS WAY</div>
+        <p>Credentials never need to pass through the agent in the first place, rather than trusting the agent to handle them carefully. Nothing to leak, because there's nothing there to see.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="stage">
+    <div class="stage-num">03</div>
+    <div>
+      <h2>You watch the agent explore on its own</h2>
+      <p>Once you're signed in, the agent takes over — clicking through screens, reading labels, opening menus, mapping the product out as it goes. You're watching this happen live, in the same window, not reading about it afterward.</p>
+      <p>For every screen that's meaningfully different from the last, the agent records a structured snapshot: what the screen is for, how it's laid out, and every component the agent can identify. This is the raw material everything else is built from.</p>
+    </div>
+  </div>
+
+  <div class="stage">
+    <div class="stage-num">04</div>
+    <div>
+      <h2>You can steer the agent, or it'll ask <span class="stage-tag">YOU DECIDE</span></h2>
+      <p>See something you want the agent to focus on — a specific flow, a page you care about? Tell the agent directly, any time, and it'll factor that in right away.</p>
+      <p>The agent also knows when to check in on its own: if something is genuinely ambiguous, the agent stops and asks rather than guessing. And before anything with a real external effect — sending a message, connecting a real account, entering payment details, deleting anything — the agent always describes what it's about to do and waits for your OK. That last part isn't a setting you can turn off to move faster.</p>
+      <div class="detail-box">
+        <div class="label mono">EXAMPLE</div>
+        <p>"This looks like it requires a connected email account before I can test sending — should I try connecting one, or leave this as an open question?"</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="stage" style="border-bottom: 1px solid var(--line);">
+    <div class="stage-num">05</div>
+    <div>
+      <h2>You get your report</h2>
+      <p>A structured screen inventory, a navigation flow map showing how everything connects, friction points tied to specific evidence rather than general impressions, and an honest account of anything the agent didn't get to — not a polished narrative dressed up to look more complete than the run actually was.</p>
+    </div>
+  </div>
+
+</main>
+
+<div class="cta-section">
+  <h2>See it for yourself</h2>
+  <p>Point the agent at any product and watch what comes back.</p>
+  <a href="/start" class="btn-primary">Try now</a>
+</div>
+
+<footer>
+  <div>SYNTHETIC_PM</div>
+  <div><a href="/" style="text-decoration:none;">← Back home</a></div>
+</footer>
+
+<div style="position:fixed; bottom:26px; right:26px; z-index:999; display:flex; align-items:center; gap:12px;">
+  <div style="background:#25D366; color:white; border-radius:999px; padding:11px 20px; font-family:monospace; font-size:14px; font-weight:700; box-shadow:0 3px 12px rgba(0,0,0,0.2); white-space:nowrap;">Got questions?</div>
+  <a href="https://wa.me/16179590354?text=Hi!%20I%27d%20like%20to%20try%20Synthetic%20PM." class="whatsapp-float" target="_blank" rel="noopener" aria-label="Message on WhatsApp" style="width:80px; height:80px;">
+    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" style="width:38px; height:38px;">
+      <path d="M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9l-5 4v-4H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z" fill="white"/>
+    </svg>
+  </a>
+</div>
+
+</body>
+</html>
