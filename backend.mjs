@@ -1927,10 +1927,10 @@ const server = createServer(async (req, res) => {
       <h1>Synthetic PM: Your product intel wingman</h1>
       <p>Point it at a product — it maps the real user journey.</p>
       <ul style="text-align:left; color:#5B6259; font-size:14px; line-height:1.6; padding-left:20px; margin:0 0 20px;">
-        <li>Use a real email — your access link and final report both go there</li>
+        <li>Use work email — you will find access URL & report</li>
         <li>1 free exploration per verified email</li>
-        <li>Free trial includes 30 agent actions — usually enough for 2–5 product areas</li>
-        <li>Create the target account first so the agent can start exploring right away</li>
+        <li>Free trial caps at 30 actions — 2–5 sections</li>
+        <li>Register beforehand — session time is billed either way</li>
       </ul>
       <form method="POST" action="/signup">
         <label>Name</label>
