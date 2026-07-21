@@ -4,7 +4,7 @@ import { chromium } from "playwright-core";
 import OpenAI from "openai";
 import { Resend } from "resend";
 import { createServer } from "http";
-import { randomBytes } from "crypto";
+import { randomBytes, createHash } from "crypto";
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
 import { basename, extname } from "path";
 
@@ -89,14 +89,25 @@ function sanitizeField(value, fieldName) {
   return value;
 }
 
-const usedIdentities = new Set();
-function identityAlreadyUsed(email, ip) {
-  return usedIdentities.has(email) || usedIdentities.has(ip);
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
 }
-function markIdentityUsed(email, ip) {
-  usedIdentities.add(email);
-  usedIdentities.add(ip);
+
+function emailHash(value) {
+  return createHash("sha256").update(normalizeEmail(value)).digest("hex");
 }
+
+const TRIAL_BYPASS_EMAILS = new Set(
+  String(process.env.TRIAL_BYPASS_EMAILS || "")
+    .split(",")
+    .map(normalizeEmail)
+    .filter(Boolean)
+);
+
+function isTrialBypassEmail(email) {
+  return TRIAL_BYPASS_EMAILS.has(normalizeEmail(email));
+}
+
 function getClientIp(req) {
   const xff = req.headers["x-forwarded-for"];
   if (xff) return xff.split(",")[0].trim();
@@ -104,7 +115,14 @@ function getClientIp(req) {
 }
 
 const pendingSignups = new Map();
+const pendingTokenByEmail = new Map();
 const sessions = new Map();
+
+const TRIAL_LEDGER_TITLE = "_Synthetic PM Trial Ledger";
+const usedTrialHashes = new Set();
+const trialClaimsInProgress = new Set();
+let trialLedgerPageIdPromise = null;
+let trialLedgerLoadedPromise = null;
 
 function createSessionState(token, data) {
   return {
@@ -1006,6 +1024,150 @@ async function notionRequest(endpoint, options = {}) {
   return data;
 }
 
+
+async function listAllNotionChildren(blockId) {
+  const results = [];
+  let cursor = null;
+
+  do {
+    const query = new URLSearchParams({ page_size: "100" });
+    if (cursor) query.set("start_cursor", cursor);
+
+    const response = await notionRequest(
+      `/blocks/${blockId}/children?${query.toString()}`,
+      { method: "GET" }
+    );
+
+    results.push(...(response.results || []));
+    cursor = response.has_more ? response.next_cursor : null;
+  } while (cursor);
+
+  return results;
+}
+
+async function getTrialLedgerPageId() {
+  if (!trialLedgerPageIdPromise) {
+    trialLedgerPageIdPromise = (async () => {
+      const children = await listAllNotionChildren(NOTION_PARENT_PAGE_ID);
+      const existing = children.find(
+        (block) =>
+          block.type === "child_page" &&
+          block.child_page?.title === TRIAL_LEDGER_TITLE
+      );
+
+      if (existing?.id) return existing.id;
+
+      const ledgerPage = await notionRequest("/pages", {
+        method: "POST",
+        body: JSON.stringify({
+          parent: { page_id: NOTION_PARENT_PAGE_ID },
+          properties: {
+            title: { title: notionRichText(TRIAL_LEDGER_TITLE) },
+          },
+          children: [
+            notionParagraph(
+              "Internal ledger used to enforce one free Synthetic PM exploration per verified email."
+            ),
+          ],
+        }),
+      });
+
+      return ledgerPage.id;
+    })().catch((err) => {
+      trialLedgerPageIdPromise = null;
+      throw err;
+    });
+  }
+
+  return trialLedgerPageIdPromise;
+}
+
+async function loadPersistentTrialLedger() {
+  if (!trialLedgerLoadedPromise) {
+    trialLedgerLoadedPromise = (async () => {
+      const ledgerPageId = await getTrialLedgerPageId();
+      const children = await listAllNotionChildren(ledgerPageId);
+
+      for (const block of children) {
+        if (block.type !== "child_page") continue;
+        const title = String(block.child_page?.title || "");
+        if (title.startsWith("trial:")) {
+          usedTrialHashes.add(title.slice("trial:".length));
+        }
+      }
+    })().catch((err) => {
+      trialLedgerLoadedPromise = null;
+      throw err;
+    });
+  }
+
+  return trialLedgerLoadedPromise;
+}
+
+async function trialAlreadyUsed(email) {
+  const normalized = normalizeEmail(email);
+  if (!normalized || isTrialBypassEmail(normalized)) return false;
+
+  const hash = emailHash(normalized);
+  if (usedTrialHashes.has(hash)) return true;
+
+  try {
+    await loadPersistentTrialLedger();
+  } catch (err) {
+    console.error("Could not load persistent trial ledger; using in-memory fallback:", err);
+  }
+
+  return usedTrialHashes.has(hash);
+}
+
+function reserveTrialClaim(email) {
+  const normalized = normalizeEmail(email);
+  if (!normalized || isTrialBypassEmail(normalized)) return null;
+
+  const hash = emailHash(normalized);
+  if (usedTrialHashes.has(hash) || trialClaimsInProgress.has(hash)) return false;
+
+  trialClaimsInProgress.add(hash);
+  return hash;
+}
+
+function releaseTrialClaim(hash) {
+  if (hash) trialClaimsInProgress.delete(hash);
+}
+
+async function recordTrialUse(email, session) {
+  const normalized = normalizeEmail(email);
+  if (!normalized || isTrialBypassEmail(normalized)) return;
+
+  const hash = emailHash(normalized);
+  if (usedTrialHashes.has(hash)) return;
+
+  // Add immediately so two requests in the same process cannot claim the same trial.
+  usedTrialHashes.add(hash);
+
+  try {
+    const ledgerPageId = await getTrialLedgerPageId();
+    await notionRequest("/pages", {
+      method: "POST",
+      body: JSON.stringify({
+        parent: { page_id: ledgerPageId },
+        properties: {
+          title: { title: notionRichText(`trial:${hash}`) },
+        },
+        children: [
+          notionParagraph(`Email: ${normalized}`),
+          notionParagraph(`Started: ${new Date().toISOString()}`),
+          notionParagraph(`Product: ${session?.targetProduct || "(unknown)"}`),
+        ],
+      }),
+    });
+  } catch (err) {
+    // The active run should not fail because the ledger write failed. The in-memory
+    // guard remains active until the process restarts, and the error is visible in logs.
+    console.error("Could not persist trial usage to Notion:", err);
+  }
+}
+
 function notionRichText(value, annotations = {}) {
   const text = String(value || "");
   if (!text) return [];
@@ -1765,9 +1927,10 @@ const server = createServer(async (req, res) => {
       <h1>Synthetic PM: Your product intel wingman</h1>
       <p>Point it at a product — it maps the real user journey.</p>
       <ul style="text-align:left; color:#5B6259; font-size:14px; line-height:1.6; padding-left:20px; margin:0 0 20px;">
-        <li>1 free exploration per email</li>
-        <li>Free trial caps at 30 actions — about 2-5 sections</li>
-        <li>Register beforehand — session time is billed either way</li>
+        <li>Use a real email — your access link and final report both go there</li>
+        <li>1 free exploration per verified email</li>
+        <li>Free trial includes 30 agent actions — usually enough for 2–5 product areas</li>
+        <li>Create the target account first so the agent can start exploring right away</li>
       </ul>
       <form method="POST" action="/signup">
         <label>Name</label>
@@ -1804,7 +1967,7 @@ const server = createServer(async (req, res) => {
     req.on("data", (c) => (body += c));
     req.on("end", async () => {
       const params = new URLSearchParams(body);
-      const email = params.get("email");
+      const email = normalizeEmail(params.get("email"));
       const targetProduct = params.get("target_product");
       const name = params.get("name") || "";
       const role = params.get("role") || "";
@@ -1819,19 +1982,107 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      if (identityAlreadyUsed(email, ip)) {
+      if (await trialAlreadyUsed(email)) {
         res.writeHead(200, { "Content-Type": "text/html" });
-        res.end(page("Already used", `<div class="card-wrap"><div class="card"><h1>You've already used your free exploration</h1><p>Message us on WhatsApp to arrange another one.</p></div></div>`));
+        res.end(page("Already used", `<div class="card-wrap"><div class="card"><h1>You’ve already used your free exploration</h1><p>Need another run? <a href="https://wa.me/16179590354" target="_blank" rel="noopener">Message Bo on WhatsApp</a>.</p></div></div>`));
         return;
       }
 
+      const previousToken = pendingTokenByEmail.get(email);
+      if (previousToken) pendingSignups.delete(previousToken);
+
       const token = randomBytes(16).toString("hex");
       pendingSignups.set(token, { email, ip, targetProduct, ownership, name, role, focusArea, whatsapp });
+      pendingTokenByEmail.set(email, token);
       const confirmUrl = `${BASE_URL}/confirm?token=${token}`;
 
+      const safeName = String(name || "there")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+
+      const safeTargetProduct = String(targetProduct)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+
+      const safeConfirmUrl = String(confirmUrl)
+        .replace(/&/g, "&amp;")
+        .replace(/"/g, "&quot;");
+
       const { error } = await resend.emails.send({
-        from: FROM_EMAIL, to: email, subject: "Confirm your Synthetic PM access",
-        html: `<p>Hi ${name || "there"}, click to confirm and start exploring <strong>${targetProduct}</strong>:</p><p><a href="${confirmUrl}">${confirmUrl}</a></p>`,
+        from: FROM_EMAIL,
+        to: email,
+        subject: "Your Synthetic PM run is ready — confirm your email",
+        html: `
+          <!doctype html>
+          <html>
+            <body style="margin:0; padding:0; background:#EEF0EA; color:#14181B; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;">
+              <div style="padding:32px 16px;">
+                <div style="max-width:600px; margin:0 auto; background:#FFFFFF; border:1px solid #CBD0C4; border-radius:8px; overflow:hidden;">
+                  <div style="padding:24px 28px; border-bottom:1px solid #E3E6DE; font-family:monospace; font-size:14px; font-weight:700; letter-spacing:0.04em;">
+                    SYNTHETIC<span style="color:#E8502B;">_</span>PM
+                  </div>
+
+                  <div style="padding:34px 28px 30px;">
+                    <p style="margin:0 0 16px; font-size:16px; line-height:1.65;">Hi ${safeName},</p>
+
+                    <p style="margin:0 0 24px; font-size:17px; line-height:1.65;">
+                      You’re one click away from launching a Synthetic PM run on
+                      <strong>${safeTargetProduct}</strong>.
+                    </p>
+
+                    <p style="margin:0 0 28px;">
+                      <a href="${safeConfirmUrl}" style="display:inline-block; background:#E8502B; color:#FFFFFF; text-decoration:none; font-size:15px; font-weight:700; padding:14px 22px; border-radius:4px;">
+                        Start exploring →
+                      </a>
+                    </p>
+
+                    <div style="background:#F6F7F3; border:1px solid #E0E4DA; border-radius:6px; padding:18px 20px; margin-bottom:24px;">
+                      <p style="margin:0 0 10px; font-size:14px; font-weight:700;">Here’s what happens next:</p>
+                      <ol style="margin:0; padding-left:20px; color:#5B6259; font-size:14px; line-height:1.8;">
+                        <li>You sign in to the product.</li>
+                        <li>The agent explores while you watch and steer.</li>
+                        <li>We send you the product journey report.</li>
+                      </ol>
+                    </div>
+
+                    <p style="margin:0 0 20px; font-size:16px; line-height:1.65;">
+                      No sales call. No setup maze. Just the product.
+                    </p>
+
+                    <p style="margin:0 0 14px; color:#5B6259; font-size:15px; line-height:1.65;">
+                      Synthetic PM is still early, so feedback is especially useful. The fastest way to reach me is on WhatsApp:
+                    </p>
+
+                    <p style="margin:0 0 26px;">
+                      <a href="https://wa.me/16179590354" style="display:inline-block; border:1px solid #2F6A4C; color:#2F6A4C; text-decoration:none; font-size:14px; font-weight:700; padding:11px 16px; border-radius:4px;">
+                        Message Bo on WhatsApp →
+                      </a>
+                    </p>
+
+                    <p style="margin:0 0 4px; font-size:15px; line-height:1.6;">Thanks for trying something early.</p>
+                    <p style="margin:0 0 26px; font-size:15px; line-height:1.6;"><strong>Bo</strong><br>Founder, Synthetic PM</p>
+
+                    <p style="margin:0 0 8px; color:#7A8178; font-size:12px; line-height:1.6;">
+                      Button not working? Copy and paste this link into your browser:
+                    </p>
+                    <p style="margin:0; font-size:12px; line-height:1.6; word-break:break-all;">
+                      <a href="${safeConfirmUrl}" style="color:#2F6A4C;">${safeConfirmUrl}</a>
+                    </p>
+                  </div>
+
+                  <div style="padding:18px 28px; background:#F6F7F3; border-top:1px solid #E3E6DE; color:#7A8178; font-size:12px; line-height:1.5;">
+                    You received this email because a Synthetic PM exploration was requested using this address.
+                  </div>
+                </div>
+              </div>
+            </body>
+          </html>`,
       });
 
       if (error) {
@@ -1857,6 +2108,11 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (!sessions.has(token)) {
+      if (await trialAlreadyUsed(pending.email)) {
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(page("Already used", `<div class="card-wrap"><div class="card"><h1>You’ve already used your free exploration</h1><p>Need another run? <a href="https://wa.me/16179590354" target="_blank" rel="noopener">Message Bo on WhatsApp</a>.</p></div></div>`));
+        return;
+      }
       sessions.set(token, createSessionState(token, pending));
     }
     res.writeHead(200, { "Content-Type": "text/html" });
@@ -1870,14 +2126,30 @@ const server = createServer(async (req, res) => {
   if (url.pathname === "/session-begin" && req.method === "POST") {
     if (!session) { res.writeHead(404); res.end("{}"); return; }
     if (session.bbSessionId) { res.writeHead(200); res.end(JSON.stringify({ started: true })); return; }
+    let trialClaimHash = null;
     try {
+      if (await trialAlreadyUsed(session.email)) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "trial_already_used" }));
+        return;
+      }
+
+      trialClaimHash = reserveTrialClaim(session.email);
+      if (trialClaimHash === false) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "trial_already_in_progress" }));
+        return;
+      }
+
       await beginBrowserSession(session);
-      markIdentityUsed(session.email, session.ip);
+      await recordTrialUse(session.email, session);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ started: true }));
     } catch (err) {
       console.error("Failed to begin browser session:", err);
       res.writeHead(500); res.end(JSON.stringify({ error: String(err) }));
+    } finally {
+      releaseTrialClaim(trialClaimHash);
     }
     return;
   }
