@@ -5,7 +5,7 @@ import OpenAI from "openai";
 import { Resend } from "resend";
 import { createServer } from "http";
 import { randomBytes, createHash } from "crypto";
-import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
+import { writeFileSync, appendFileSync, readFileSync, existsSync, mkdirSync } from "fs";
 import { basename, extname } from "path";
 
 const REQUIRED_ENV = ["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "OPENAI_API_KEY", "RESEND_API_KEY", "NOTION_API_KEY", "NOTION_PARENT_PAGE"];
@@ -73,6 +73,9 @@ const ACTION_BUDGET = 30;
 const RAW_ACTION_CAP = 100;
 const MAX_ITERATIONS = 70;
 const EXPLORATION_MAX_TOKENS = 4096;
+const JOURNEY_MAX_TOKENS = Number(process.env.JOURNEY_MAX_TOKENS || 8000);
+const JOURNEY_RETRY_MAX_TOKENS = Number(process.env.JOURNEY_RETRY_MAX_TOKENS || 12000);
+const JOURNEY_REASONING_EFFORT = process.env.JOURNEY_REASONING_EFFORT || "medium";
 const VIEWPORT_WIDTH = 1280;
 const VIEWPORT_HEIGHT = 800;
 const NEAR_BUDGET_THRESHOLD = 5;
@@ -120,10 +123,13 @@ const pendingTokenByEmail = new Map();
 const sessions = new Map();
 
 const TRIAL_LEDGER_TITLE = "_Synthetic PM Trial Ledger";
+const API_FAILURE_LOG_TITLE = "_Synthetic PM API Failure Log";
+const API_FAILURE_LOG_FILE = `${RUNS_DIR}/api_failures.jsonl`;
 const usedTrialHashes = new Set();
 const trialClaimsInProgress = new Set();
 let trialLedgerPageIdPromise = null;
 let trialLedgerLoadedPromise = null;
+let apiFailureLogPageIdPromise = null;
 
 function createSessionState(token, data) {
   return {
@@ -154,10 +160,142 @@ function createSessionState(token, data) {
     runLogFile: null,
     report: null,
     reportGenerating: false,
+    reportFailed: false,
+    reportError: null,
     notionReportPageId: null,
     notionReportUrl: null,
     createdAt: Date.now(),
   };
+}
+
+function serializeApiError(error) {
+  const err = error || {};
+
+  return {
+    name: err.name || null,
+    message: String(err.message || err || "Unknown API error").slice(0, 2000),
+    status: err.status ?? err.statusCode ?? null,
+    code: err.code ?? err.error?.code ?? null,
+    type: err.type ?? err.error?.type ?? null,
+    request_id:
+      err.request_id ??
+      err.requestId ??
+      err.headers?.["x-request-id"] ??
+      err.headers?.get?.("x-request-id") ??
+      null,
+  };
+}
+
+function safeFailureDetails(details) {
+  if (!details || typeof details !== "object") return {};
+
+  const safe = {};
+
+  for (const [key, value] of Object.entries(details)) {
+    if (
+      /key|secret|token|authorization|cookie|prompt|screenshot|image|password/i.test(
+        key
+      )
+    ) {
+      continue;
+    }
+
+    if (value === undefined) continue;
+
+    if (typeof value === "string") {
+      safe[key] = value.slice(0, 1000);
+    } else if (
+      value === null ||
+      typeof value === "number" ||
+      typeof value === "boolean"
+    ) {
+      safe[key] = value;
+    } else {
+      try {
+        safe[key] = JSON.parse(
+          JSON.stringify(value).slice(0, 3000)
+        );
+      } catch {
+        safe[key] = String(value).slice(0, 1000);
+      }
+    }
+  }
+
+  return safe;
+}
+
+function recordApiFailure({
+  provider,
+  operation,
+  error,
+  session = null,
+  details = {},
+  persistToNotion = true,
+}) {
+  const record = {
+    timestamp: new Date().toISOString(),
+    provider: String(provider || "unknown"),
+    operation: String(operation || "unknown"),
+    model:
+      provider === "openai"
+        ? OPENAI_MODEL
+        : null,
+    session_prefix:
+      session?.token
+        ? session.token.slice(0, 8)
+        : null,
+    email_hash:
+      session?.email
+        ? emailHash(session.email)
+        : null,
+    target_product:
+      session?.targetProduct
+        ? String(session.targetProduct).slice(0, 300)
+        : null,
+    exploration_credits:
+      session?.actionsUsed ?? null,
+    raw_browser_operations:
+      session?.rawActionsUsed ?? null,
+    error: serializeApiError(error),
+    details: safeFailureDetails(details),
+  };
+
+  const serialized = JSON.stringify(record);
+
+  console.error(`[API_FAILURE] ${serialized}`);
+
+  try {
+    if (!existsSync(RUNS_DIR)) {
+      mkdirSync(RUNS_DIR, { recursive: true });
+    }
+
+    appendFileSync(
+      API_FAILURE_LOG_FILE,
+      `${serialized}\n`,
+      "utf8"
+    );
+  } catch (logError) {
+    console.error(
+      "[API_FAILURE_LOCAL_LOG_FAILED]",
+      serializeApiError(logError)
+    );
+  }
+
+  if (
+    persistToNotion &&
+    provider !== "notion"
+  ) {
+    void persistApiFailureToNotion(record).catch(
+      (persistError) => {
+        console.error(
+          "[API_FAILURE_NOTION_LOG_FAILED]",
+          serializeApiError(persistError)
+        );
+      }
+    );
+  }
+
+  return record;
 }
 
 function logEvent(session, entry) {
@@ -792,11 +930,32 @@ async function runExplorationLoop(session) {
       } catch (err) {
         session.explorationFailed = true;
         session.explorationError = String(err);
+
+        recordApiFailure({
+          provider: "openai",
+          operation:
+            "exploration_response",
+          error: err,
+          session,
+          details: {
+            iteration: iterations,
+            reasoning_effort:
+              OPENAI_REASONING_EFFORT,
+            max_output_tokens:
+              EXPLORATION_MAX_TOKENS,
+          },
+        });
+
         logEvent(session, {
           type: "system",
           text: `OpenAI API call failed: ${session.explorationError}`,
         });
-        console.error("OpenAI exploration call failed:", err);
+
+        console.error(
+          "OpenAI exploration call failed:",
+          err
+        );
+
         break;
       }
 
@@ -1233,48 +1392,236 @@ async function synthesizeUserJourney(
   session,
   screenRecords
 ) {
-  const response = await openai.responses.create({
-    model: OPENAI_MODEL,
-    reasoning: { effort: OPENAI_REASONING_EFFORT },
-    max_output_tokens: 1800,
-    instructions: JOURNEY_SYNTHESIS_PROMPT,
-    tools: [JOURNEY_TOOL],
-    tool_choice: {
-      type: "function",
-      name: "submit_user_journey",
+  const attempts = [
+    {
+      maxOutputTokens:
+        JOURNEY_MAX_TOKENS,
+      label: "journey_synthesis_attempt_1",
     },
-    parallel_tool_calls: false,
-    input:
-      `${buildJourneyEvidence(session, screenRecords)}\n\n` +
-      `Create the complete product user journey map now.`,
-  });
+    {
+      maxOutputTokens:
+        JOURNEY_RETRY_MAX_TOKENS,
+      label: "journey_synthesis_attempt_2",
+    },
+  ];
 
-  logOpenAIUsage(response, "journey synthesis");
+  let lastError = null;
 
-  const toolCall = (response.output || []).find(
-    (item) =>
-      item.type === "function_call" &&
-      item.name === "submit_user_journey"
-  );
+  for (
+    let index = 0;
+    index < attempts.length;
+    index++
+  ) {
+    const attempt = attempts[index];
 
-  if (!toolCall) {
-    throw new Error("Journey synthesis did not call submit_user_journey.");
+    try {
+      const response =
+        await openai.responses.create({
+          model: OPENAI_MODEL,
+          reasoning: {
+            effort:
+              JOURNEY_REASONING_EFFORT,
+          },
+          max_output_tokens:
+            attempt.maxOutputTokens,
+          instructions:
+            JOURNEY_SYNTHESIS_PROMPT,
+          tools: [JOURNEY_TOOL],
+          tool_choice: {
+            type: "function",
+            name: "submit_user_journey",
+          },
+          parallel_tool_calls: false,
+          input:
+            `${buildJourneyEvidence(
+              session,
+              screenRecords
+            )}\n\n` +
+            `Create the complete product user journey map now. ` +
+            `Return the full Mermaid source through submit_user_journey. ` +
+            `Do not simplify the result into a product-to-screen inventory.`,
+        });
+
+      logOpenAIUsage(
+        response,
+        attempt.label
+      );
+
+      const diagnostics = {
+        attempt: index + 1,
+        response_id:
+          response.id || null,
+        response_status:
+          response.status || null,
+        incomplete_details:
+          response.incomplete_details ||
+          null,
+        output_types:
+          (response.output || []).map(
+            (item) => item.type
+          ),
+        input_tokens:
+          response.usage?.input_tokens ||
+          null,
+        output_tokens:
+          response.usage?.output_tokens ||
+          null,
+        reasoning_tokens:
+          response.usage
+            ?.output_tokens_details
+            ?.reasoning_tokens ||
+          null,
+        max_output_tokens:
+          attempt.maxOutputTokens,
+        reasoning_effort:
+          JOURNEY_REASONING_EFFORT,
+      };
+
+      if (
+        response.status &&
+        response.status !== "completed"
+      ) {
+        const error =
+          new Error(
+            `Journey synthesis response status was ${response.status}.`
+          );
+
+        error.code =
+          response.incomplete_details
+            ?.reason ||
+          "response_not_completed";
+
+        error.responseDiagnostics =
+          diagnostics;
+
+        throw error;
+      }
+
+      const toolCall =
+        (response.output || []).find(
+          (item) =>
+            item.type ===
+              "function_call" &&
+            item.name ===
+              "submit_user_journey"
+        );
+
+      if (!toolCall) {
+        const error =
+          new Error(
+            "Journey synthesis did not call submit_user_journey."
+          );
+
+        error.code =
+          "missing_journey_tool_call";
+
+        error.responseDiagnostics =
+          diagnostics;
+
+        throw error;
+      }
+
+      const args =
+        parseOpenAIFunctionArguments(
+          toolCall
+        );
+
+      const source =
+        String(
+          args.mermaid_source || ""
+        ).trim();
+
+      if (!source) {
+        const error =
+          new Error(
+            "Journey synthesis did not return Mermaid source."
+          );
+
+        error.code =
+          "empty_mermaid_source";
+
+        error.responseDiagnostics =
+          diagnostics;
+
+        throw error;
+      }
+
+      if (
+        !/^(flowchart|graph)\s+(TD|TB|LR|RL)/i.test(
+          source
+        )
+      ) {
+        const error =
+          new Error(
+            "Journey synthesis returned invalid Mermaid flowchart syntax."
+          );
+
+        error.code =
+          "invalid_mermaid_source";
+
+        error.responseDiagnostics =
+          diagnostics;
+
+        throw error;
+      }
+
+      return {
+        mermaid_source: source,
+        synthesis_diagnostics:
+          diagnostics,
+      };
+    } catch (err) {
+      lastError = err;
+
+      recordApiFailure({
+        provider: "openai",
+        operation:
+          attempt.label,
+        error: err,
+        session,
+        details:
+          err.responseDiagnostics || {
+            attempt: index + 1,
+            max_output_tokens:
+              attempt.maxOutputTokens,
+            reasoning_effort:
+              JOURNEY_REASONING_EFFORT,
+          },
+      });
+
+      console.error(
+        `Journey synthesis attempt ${index + 1} failed:`,
+        err
+      );
+
+      if (
+        index <
+        attempts.length - 1
+      ) {
+        logEvent(session, {
+          type: "system",
+          text:
+            "The first report-generation attempt was incomplete. Retrying with a larger output allowance.",
+        });
+      }
+    }
   }
 
-  const args = parseOpenAIFunctionArguments(toolCall);
-  const source = String(args.mermaid_source || "").trim();
+  const finalError =
+    new Error(
+      `User journey synthesis failed after ${attempts.length} attempts: ${
+        lastError?.message ||
+        String(lastError)
+      }`
+    );
 
-  if (!source) {
-    throw new Error("Journey synthesis did not return Mermaid source.");
-  }
+  finalError.code =
+    "journey_synthesis_exhausted";
 
-  if (!/^(flowchart|graph)\s+(TD|TB|LR|RL)/i.test(source)) {
-    throw new Error("Journey synthesis returned invalid Mermaid flowchart syntax.");
-  }
+  finalError.cause =
+    lastError;
 
-  return {
-    mermaid_source: source,
-  };
+  throw finalError;
 }
 
 function buildFallbackJourney(
@@ -1346,7 +1693,28 @@ async function notionRequest(endpoint, options = {}) {
   }
 
   if (!response.ok) {
-    throw new Error(`Notion API ${response.status}: ${JSON.stringify(data)}`);
+    const error =
+      new Error(
+        `Notion API ${response.status}: ${JSON.stringify(data)}`
+      );
+
+    error.status = response.status;
+    error.code = data?.code || null;
+
+    recordApiFailure({
+      provider: "notion",
+      operation:
+        `${options.method || "GET"} ${endpoint}`,
+      error,
+      details: {
+        endpoint,
+        status: response.status,
+        notion_code: data?.code || null,
+      },
+      persistToNotion: false,
+    });
+
+    throw error;
   }
 
   return data;
@@ -1408,6 +1776,91 @@ async function getTrialLedgerPageId() {
   }
 
   return trialLedgerPageIdPromise;
+}
+
+async function getApiFailureLogPageId() {
+  if (!apiFailureLogPageIdPromise) {
+    apiFailureLogPageIdPromise = (async () => {
+      const children =
+        await listAllNotionChildren(
+          NOTION_PARENT_PAGE_ID
+        );
+
+      const existing = children.find(
+        (block) =>
+          block.type === "child_page" &&
+          block.child_page?.title ===
+            API_FAILURE_LOG_TITLE
+      );
+
+      if (existing?.id) {
+        return existing.id;
+      }
+
+      const page =
+        await notionRequest("/pages", {
+          method: "POST",
+          body: JSON.stringify({
+            parent: {
+              page_id:
+                NOTION_PARENT_PAGE_ID,
+            },
+            properties: {
+              title: {
+                title:
+                  notionRichText(
+                    API_FAILURE_LOG_TITLE
+                  ),
+              },
+            },
+            children: [
+              notionParagraph(
+                "Private structured log of external API failures. Raw emails, prompts, screenshots, credentials, and API keys are intentionally excluded."
+              ),
+            ],
+          }),
+        });
+
+      return page.id;
+    })().catch((err) => {
+      apiFailureLogPageIdPromise = null;
+      throw err;
+    });
+  }
+
+  return apiFailureLogPageIdPromise;
+}
+
+async function persistApiFailureToNotion(record) {
+  const pageId =
+    await getApiFailureLogPageId();
+
+  const compact = JSON.stringify(
+    record,
+    null,
+    2
+  );
+
+  await appendNotionBlocks(
+    pageId,
+    [
+      notionHeading(
+        3,
+        `${record.timestamp} — ${record.provider}/${record.operation}`
+      ),
+      {
+        object: "block",
+        type: "code",
+        code: {
+          rich_text:
+            notionRichText(compact),
+          language: "json",
+          caption: [],
+        },
+      },
+      notionDivider(),
+    ]
+  );
 }
 
 async function loadPersistentTrialLedger() {
@@ -1597,7 +2050,25 @@ async function uploadImageToNotion(imagePath) {
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`Notion screenshot upload failed (${response.status}): ${body}`);
+    const error =
+      new Error(
+        `Notion screenshot upload failed (${response.status}): ${body}`
+      );
+
+    error.status = response.status;
+
+    recordApiFailure({
+      provider: "notion",
+      operation: "screenshot_upload",
+      error,
+      details: {
+        status: response.status,
+        filename,
+      },
+      persistToNotion: false,
+    });
+
+    throw error;
   }
 
   return upload.id;
@@ -1775,6 +2246,8 @@ async function publishPrivateNotionReport(
 
 async function generateReport(session) {
   session.reportGenerating = true;
+  session.reportFailed = false;
+  session.reportError = null;
 
   const screenRecords =
     session.explorationLog.filter(
@@ -1792,16 +2265,27 @@ async function generateReport(session) {
         screenRecords
       );
   } catch (err) {
+    session.reportGenerating = false;
+    session.reportFailed = true;
+    session.reportError =
+      String(
+        err?.message ||
+        err
+      );
+    session.report = null;
+
     console.error(
-      "User journey synthesis failed, using fallback:",
+      "User journey synthesis failed after retry; no fallback report was published:",
       err
     );
 
-    journey =
-      buildFallbackJourney(
-        screenRecords,
-        session.targetProduct
-      );
+    logEvent(session, {
+      type: "system",
+      text:
+        "User journey report generation failed after two attempts. No simplified fallback report was published.",
+    });
+
+    return;
   }
 
   const reportText =
@@ -1810,8 +2294,6 @@ async function generateReport(session) {
       session.targetProduct
     );
 
-  // The existing dashboard uses session.report
-  // to detect that generation has completed.
   session.report = reportText;
 
   let notionReport = null;
@@ -1836,11 +2318,23 @@ async function generateReport(session) {
 
     logEvent(session, {
       type: "system",
-
       text:
         "Private user journey report created successfully.",
     });
   } catch (err) {
+    recordApiFailure({
+      provider: "notion",
+      operation:
+        "publish_user_journey_report",
+      error: err,
+      session,
+      details: {
+        screen_records:
+          screenRecords.length,
+      },
+      persistToNotion: false,
+    });
+
     console.error(
       "Private Notion report publishing failed:",
       err
@@ -1848,9 +2342,8 @@ async function generateReport(session) {
 
     logEvent(session, {
       type: "system",
-
       text:
-        "User journey report publishing failed; Mermaid fallback remains available.",
+        "The user journey was generated, but publishing it to Notion failed. The Mermaid report remains available in the dashboard.",
     });
   }
 
@@ -1869,58 +2362,92 @@ async function generateReport(session) {
             "&quot;"
           );
 
-      await resend.emails.send({
-        from: FROM_EMAIL,
+      const result =
+        await resend.emails.send({
+          from: FROM_EMAIL,
+          to: session.email,
+          subject:
+            `Your Synthetic PM report: ${session.targetProduct}`,
+          html:
+            `<p>Your Synthetic PM exploration is complete.</p>`
+            + `<p>`
+            + `<a href="${safeUrl}">`
+            + `Open your user journey report in Notion`
+            + `</a>`
+            + `</p>`,
+        });
 
-        to: session.email,
+      if (result?.error) {
+        const error =
+          new Error(
+            result.error.message ||
+            "Resend returned an error."
+          );
 
-        subject:
-          `Your Synthetic PM report: ${session.targetProduct}`,
+        error.code =
+          result.error.name ||
+          result.error.code ||
+          null;
 
-        html:
-          `<p>Your Synthetic PM exploration is complete.</p>`
-          + `<p>`
-          + `<a href="${safeUrl}">`
-          + `Open your user journey report in Notion`
-          + `</a>`
-          + `</p>`,
-      });
+        throw error;
+      }
     } else {
-      await resend.emails.send({
-        from: FROM_EMAIL,
+      const result =
+        await resend.emails.send({
+          from: FROM_EMAIL,
+          to: session.email,
+          subject:
+            `Your Synthetic PM report: ${session.targetProduct}`,
+          html:
+            `<p>`
+            + `Your Synthetic PM exploration is complete, `
+            + `but the Notion report could not be published.`
+            + `</p>`
+            + `<pre style="white-space:pre-wrap; font-family:monospace;">`
+            + `${reportText
+              .replace(
+                /&/g,
+                "&amp;"
+              )
+              .replace(
+                /</g,
+                "&lt;"
+              )
+              .replace(
+                />/g,
+                "&gt;"
+              )}`
+            + `</pre>`,
+        });
 
-        to: session.email,
+      if (result?.error) {
+        const error =
+          new Error(
+            result.error.message ||
+            "Resend returned an error."
+          );
 
-        subject:
-          `Your Synthetic PM report: ${session.targetProduct}`,
+        error.code =
+          result.error.name ||
+          result.error.code ||
+          null;
 
-        html:
-          `<p>`
-          + `Your Synthetic PM exploration is complete, `
-          + `but the Notion report could not be published.`
-          + `</p>`
-          + `<pre style="white-space:pre-wrap; font-family:monospace;">`
-          + `${reportText
-            .replace(
-              /&/g,
-              "&amp;"
-            )
-            .replace(
-              /</g,
-              "&lt;"
-            )
-            .replace(
-              />/g,
-              "&gt;"
-            )}`
-          + `</pre>`,
-      });
+        throw error;
+      }
     }
 
     console.log(
       `Report email sent to ${session.email}`
     );
   } catch (err) {
+    recordApiFailure({
+      provider: "resend",
+      operation:
+        "send_report_email",
+      error: err,
+      session,
+    });
+
     console.error(
       "Report email failed (report still available in dashboard):",
       err
@@ -2179,6 +2706,7 @@ function dashboardHtml(token) {
           state.pauseRequested ||
           state.report ||
           state.failed ||
+          state.reportFailed ||
           state.reportGenerating ||
           state.actionsUsed > 0
         );
@@ -2190,6 +2718,11 @@ function dashboardHtml(token) {
           setStep(
             4,
             '✅ Done! The report has been delivered to your email.'
+          );
+        } else if (state.reportFailed) {
+          setStep(
+            4,
+            '⚠️ Exploration completed, but the user journey report could not be generated. No simplified fallback was published. Please message Bo on WhatsApp.'
           );
         } else if (state.failed) {
           setStep(
@@ -2318,7 +2851,22 @@ function dashboardHtml(token) {
       wrapper.scrollTop = wrapper.scrollHeight;
       updatePauseUi(data);
 
-      if (data.failed) {
+      if (data.reportFailed) {
+        setStep(
+          4,
+          '⚠️ Exploration completed, but the user journey report could not be generated. No simplified fallback was published. Please message Bo on WhatsApp.'
+        );
+
+        setStatus(
+          'Report failed',
+          '#fee2e2',
+          '#991b1b'
+        );
+
+        document.getElementById('pause-btn').style.display = 'none';
+        document.getElementById('paused-strip').style.display = 'none';
+        document.getElementById('report-panel').style.display = 'none';
+      } else if (data.failed) {
         setStep(
           3,
           '⚠️ The exploration stopped because the AI service returned an error. No report was generated. Please try again or message Bo on WhatsApp.'
@@ -2734,7 +3282,24 @@ const server = createServer(async (req, res) => {
       });
 
       if (error) {
-        console.error("Resend error:", error);
+        recordApiFailure({
+          provider: "resend",
+          operation:
+            "send_confirmation_email",
+          error,
+          details: {
+            email_hash:
+              emailHash(email),
+            target_product:
+              String(targetProduct || "").slice(0, 300),
+          },
+        });
+
+        console.error(
+          "Resend error:",
+          error
+        );
+
         res.writeHead(500, { "Content-Type": "text/html" });
         res.end(page("Something went wrong", `<div class="card-wrap"><div class="card"><h1>Something went wrong</h1><p>Could not send confirmation email.</p></div></div>`));
         return;
@@ -2794,8 +3359,25 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ started: true }));
     } catch (err) {
-      console.error("Failed to begin browser session:", err);
-      res.writeHead(500); res.end(JSON.stringify({ error: String(err) }));
+      recordApiFailure({
+        provider: "browserbase",
+        operation:
+          "begin_browser_session",
+        error: err,
+        session,
+      });
+
+      console.error(
+        "Failed to begin browser session:",
+        err
+      );
+
+      res.writeHead(500);
+      res.end(
+        JSON.stringify({
+          error: String(err),
+        })
+      );
     } finally {
       releaseTrialClaim(trialClaimHash);
     }
@@ -2866,6 +3448,8 @@ const server = createServer(async (req, res) => {
       report: session.report,
       failed: session.explorationFailed,
       error: session.explorationError,
+      reportFailed: session.reportFailed,
+      reportError: session.reportError,
       paused: session.explorationPaused,
       pauseRequested: session.pauseRequested,
       actionBudget: ACTION_BUDGET,
@@ -2927,9 +3511,18 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(debugInfo.pages || []));
     } catch (err) {
+      recordApiFailure({
+        provider: "browserbase",
+        operation:
+          "fetch_live_view_pages",
+        error: err,
+        session,
+      });
+
       res.writeHead(500);
       res.end("[]");
     }
+
     return;
   }
 
