@@ -137,6 +137,10 @@ function createSessionState(token, data) {
     explorationRunning: false,
     explorationFailed: false,
     explorationError: null,
+    pauseRequested: false,
+    explorationPaused: false,
+    pauseResumeResolver: null,
+    pauseRequestedAt: null,
     keepAliveTimer: null,
     lastScreenName: null,
     lastActionSummary: null,
@@ -188,6 +192,85 @@ function startKeepAlive(session, page) {
 }
 function stopKeepAlive(session) {
   if (session.keepAliveTimer) { clearInterval(session.keepAliveTimer); session.keepAliveTimer = null; }
+}
+
+function requestExplorationPause(session) {
+  if (!session.explorationRunning) {
+    return {
+      accepted: false,
+      paused: false,
+      pauseRequested: false,
+      reason: "not_running",
+    };
+  }
+
+  session.pauseRequested = true;
+  session.pauseRequestedAt = Date.now();
+
+  return {
+    accepted: true,
+    paused: session.explorationPaused,
+    pauseRequested: true,
+  };
+}
+
+function resumeExploration(session) {
+  const wasPaused =
+    session.pauseRequested ||
+    session.explorationPaused;
+
+  session.pauseRequested = false;
+  session.pauseRequestedAt = null;
+
+  if (session.pauseResumeResolver) {
+    const resolve = session.pauseResumeResolver;
+    session.pauseResumeResolver = null;
+    resolve();
+  }
+
+  return {
+    accepted: wasPaused,
+    paused: false,
+    pauseRequested: false,
+  };
+}
+
+async function waitForResumeIfNeeded(session) {
+  if (!session.pauseRequested) return false;
+
+  if (!session.explorationPaused) {
+    session.explorationPaused = true;
+    logEvent(session, {
+      type: "system",
+      text:
+        "Pause requested. The current browser action finished, and the agent is now paused.",
+    });
+  }
+
+  startKeepAlive(session, session.page);
+
+  await new Promise((resolve) => {
+    if (!session.pauseRequested) {
+      resolve();
+      return;
+    }
+
+    session.pauseResumeResolver = resolve;
+  });
+
+  stopKeepAlive(session);
+  session.pauseResumeResolver = null;
+  session.pauseRequested = false;
+  session.pauseRequestedAt = null;
+  session.explorationPaused = false;
+
+  logEvent(session, {
+    type: "system",
+    text:
+      "Agent resumed. Taking a fresh look at the current browser state before continuing.",
+  });
+
+  return true;
 }
 async function waitForHuman(session, page, type, content) {
   startKeepAlive(session, page);
@@ -289,9 +372,16 @@ function summarizeComputerAction(action) {
 
 async function executeOpenAIComputerActions(session, actions) {
   let executed = 0;
+  let interruptedByPause = false;
 
   for (const action of Array.isArray(actions) ? actions : []) {
     if (session.actionsUsed >= ACTION_BUDGET) break;
+
+    if (session.pauseRequested) {
+      await waitForResumeIfNeeded(session);
+      interruptedByPause = true;
+      break;
+    }
 
     session.actionsUsed++;
     executed++;
@@ -388,9 +478,18 @@ async function executeOpenAIComputerActions(session, actions) {
       console.error("Computer action failed:", action, err);
       break;
     }
+
+    if (session.pauseRequested) {
+      await waitForResumeIfNeeded(session);
+      interruptedByPause = true;
+      break;
+    }
   }
 
-  return executed;
+  return {
+    executed,
+    interruptedByPause,
+  };
 }
 
 async function captureOpenAIComputerScreenshot(page) {
@@ -430,22 +529,36 @@ async function recordScreen(session, page, input) {
 
 const PHASE3_SYSTEM_PROMPT = `You are a product-thinking agent exploring a product on behalf of a human — the way a new PM would after being oriented.
 
-You have four tools:
-1. computer — click, type, scroll, screenshot. Your default tool for exploring.
-2. record_screen — call on EVERY genuinely new screen. Text fields (screen_name, purpose, layout) must be plain factual text only — no markdown, no tags, nothing resembling another tool call. The components array is REQUIRED, never empty — list at least 3-5 real UI elements. This does not count against your action budget.
-3. ask_human — only when genuinely uncertain in a way that changes your next action. Blocks until answered. Use sparingly.
-4. propose_consequential_action — before anything with a real external effect: sending, connecting a real account, payments, deletions. No exceptions. Blocks until approved or denied.
+You have six tools:
+1. computer — click, type, scroll, wait, and inspect screenshots. Your default tool for exploring.
+2. record_screen — call on EVERY genuinely new screen. Text fields must be plain factual text only. The components array is REQUIRED and must contain at least 3-5 real UI elements. This does not count against the action budget.
+3. agent_note — publish a concise reasoning summary to the human-visible log. Use this before major exploration decisions and after meaningful discoveries. State the conclusion and supporting product evidence, not private chain-of-thought or hidden deliberation. This does not count against the action budget.
+4. ask_human — only when genuine uncertainty materially changes the next action. This blocks until answered.
+5. propose_consequential_action — required before anything with a real external effect: sending, posting, connecting an account, payment, deletion, permission changes, or transmitting sensitive information.
+6. finish_exploration — use only before the 30-action budget is exhausted when there are genuinely no meaningful product areas or workflows left to discover, or when access limitations make further exploration impossible. Give a concrete reason and coverage summary.
 
-You may receive [Human note] messages at any time — real directives, act on them immediately, even if it means changing your current plan.
+You may receive [Human note] messages at any time. Treat them as real directives and act on them immediately.
+
+VISIBLE AGENT NOTES:
+- Call agent_note near the beginning to explain the survey plan.
+- Call it when choosing what to explore deeply, when identifying a prerequisite or feature gate, when finding meaningful friction, and before ending early.
+- Keep each note to 1-3 sentences.
+- Do not expose raw hidden reasoning, internal token-by-token deliberation, secrets, credentials, or sensitive data.
+- Useful note style: "Sequences appears to be a core workflow. I’ll record the structure now, then return after the breadth pass if actions remain."
 
 EXPLORATION STRATEGY — survey first, then go deep:
-Early on, identify the main navigation sections of the product (usually a sidebar or top nav). Your first priority is BREADTH: touch every main section at least once, briefly, before committing to a full deep-dive into any single workflow. You don't need to complete a whole task end-to-end during this survey pass — just enough to understand what each area is for and record it.
-Only after you've surveyed the main areas should you go deep into any one of them. When choosing where to go deep, prioritize in this order: (1) anything the user explicitly asked you to focus on, (2) whatever seems most significant for understanding how the product actually works and where it creates friction for a real user.
-A deep dive that consumes your whole budget on one workflow while leaving major sections completely unexplored is a failure mode. Breadth of coverage matters as much as depth in any one area.
+Early on, identify the main navigation sections. Your first priority is BREADTH: touch every main section at least once before committing to a deep dive. You do not need to complete every workflow during the survey pass; learn enough to understand each area's purpose and record every genuinely new screen.
+After the breadth pass, go deeper based on: (1) the user's stated focus, then (2) the most important workflow, friction, or product-value area.
+A deep dive that consumes the whole budget while leaving major navigation areas untouched is a failure mode.
 
-UNDERSTANDING FOCUS AREAS AND DIRECTIVES: When the user specifies a focus area or sends a directive using product-management or UX terminology — "user journey," "onboarding flow," "activation," "drop-off points," "the aha moment," "the main funnel" — treat this as an analytical lens to apply to your exploration, not necessarily a literal feature or navigation item to go searching for. For example, "user journey" means: trace the realistic sequence of steps a new user takes to get value from the product — it does not mean there is a UI section literally labeled "User Journey" somewhere in the nav. If a focus area doesn't match anything by name, consider whether it's describing a PM concept before spending actions hunting for it in the navigation or asking the human to clarify what they meant. Think like a product manager reading these terms, not like someone doing a literal text search.
+USE THE FULL TRIAL:
+The user has paid for a 30-action exploration budget. Continue exploring until all 30 computer actions are used unless there is genuinely nothing meaningful left to discover or access is blocked. Do not stop merely because you already have enough material for a report. When actions remain, look for unvisited navigation areas, deeper workflow states, setup requirements, empty states, feature gates, settings, reporting, billing, integrations, and cross-screen patterns.
+If you must finish before 30 actions, call finish_exploration with a concrete explanation. Do not end early with plain text alone.
 
-Only comment when something clears a real bar — a workflow decision, a cross-screen pattern, real friction. record_screen has a lower bar: call it on every new screen regardless. Keep exploring until budget is nearly used. A pause in commentary doesn't mean you're finished. If you want to give a final summary near the end, say it as plain text — never inside a tool call.`;
+UNDERSTANDING FOCUS AREAS AND DIRECTIVES:
+When the user specifies a focus area using PM or UX terminology — such as "user journey," "onboarding flow," "activation," "drop-off points," "aha moment," or "main funnel" — treat it as an analytical lens, not necessarily a literal navigation label. Think like a product manager, not a text-search bot.
+
+record_screen has a lower bar than commentary: call it on every new screen regardless.`;
 
 const OPENAI_EXPLORATION_TOOLS = [
   { type: "computer" },
@@ -470,6 +583,20 @@ const OPENAI_EXPLORATION_TOOLS = [
         },
       },
       required: ["screen_name", "purpose", "layout", "components", "state"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "agent_note",
+    description: "Show the human a concise 1-3 sentence summary of the exploration decision, product evidence, or meaningful discovery. Do not reveal private chain-of-thought.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        note: { type: "string" },
+      },
+      required: ["note"],
       additionalProperties: false,
     },
   },
@@ -502,6 +629,21 @@ const OPENAI_EXPLORATION_TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    type: "function",
+    name: "finish_exploration",
+    description: "Finish before the 30-action budget only when no meaningful product areas remain or access limitations make further discovery impossible.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        reason: { type: "string" },
+        coverage_summary: { type: "string" },
+      },
+      required: ["reason", "coverage_summary"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 function parseOpenAIFunctionArguments(item) {
@@ -525,18 +667,20 @@ async function runExplorationLoop(session) {
   session.explorationRunning = true;
   session.explorationFailed = false;
   session.explorationError = null;
+  session.pauseRequested = false;
+  session.explorationPaused = false;
+  session.pauseResumeResolver = null;
   session.report = null;
 
   let iterations = 0;
   let consecutiveNonToolStops = 0;
+  let earlyFinishRequested = false;
 
   const startText = session.focusArea
-    ? `Begin exploring ${session.targetProduct}. Start with a broad survey of the main navigation areas. The user specifically wants you to go deep on "${session.focusArea}" after the survey. First inspect the current screen with the computer tool, then record the starting screen.`
-    : `Begin exploring ${session.targetProduct}. Start with a broad survey of the main navigation areas before going deep into any single workflow. First inspect the current screen with the computer tool, then record the starting screen.`;
+    ? `Begin exploring ${session.targetProduct}. Start with a broad survey of the main navigation areas. The user specifically wants you to go deep on "${session.focusArea}" after the survey. First publish an agent_note explaining the plan, inspect the current screen with the computer tool, and record the starting screen.`
+    : `Begin exploring ${session.targetProduct}. Start with a broad survey of the main navigation areas before going deep into any single workflow. First publish an agent_note explaining the plan, inspect the current screen with the computer tool, and record the starting screen.`;
 
-  // We deliberately manage conversation history ourselves instead of relying on
-  // previous_response_id. The first computer-use request was succeeding while the
-  // stateful continuation was receiving an erroneous model-access response.
+  // Conversation history is managed explicitly rather than with previous_response_id.
   const conversationItems = [{
     role: "user",
     content: startText,
@@ -544,6 +688,16 @@ async function runExplorationLoop(session) {
 
   try {
     while (session.explorationRunning) {
+      if (session.pauseRequested) {
+        await waitForResumeIfNeeded(session);
+        conversationItems.push({
+          role: "user",
+          content:
+            "The human paused the agent and may have interacted with the browser manually. " +
+            "Take a fresh screenshot, reassess the current state, publish a concise agent_note, and continue without repeating completed work.",
+        });
+      }
+
       iterations++;
 
       if (iterations > MAX_ITERATIONS) {
@@ -562,16 +716,17 @@ async function runExplorationLoop(session) {
 
       if (remaining <= NEAR_BUDGET_THRESHOLD) {
         budgetNote =
-          `You have ${remaining} computer actions left. Prioritize recording any important unrecorded screen. ` +
-          `If exploration is complete, provide a brief final observation without calling a tool.`;
+          `You have ${remaining} computer actions left. Keep exploring until the budget reaches ${ACTION_BUDGET}. ` +
+          `Prioritize important unrecorded screens, deeper states, feature gates, and unresolved workflows. ` +
+          `Only call finish_exploration if there is genuinely nothing meaningful left or access is blocked.`;
       } else if (session.actionsUsed < SURVEY_PHASE_ACTIONS) {
         budgetNote =
           `You are in the SURVEY phase: ${session.actionsUsed} of ${ACTION_BUDGET} actions used. ` +
           `Prioritize breadth and touch every main navigation area at least once before going deep.`;
       } else {
         budgetNote = session.focusArea
-          ? `The survey phase should be largely complete. Go deeper into the user's focus area: ${session.focusArea}.`
-          : `The survey phase should be largely complete. Go deeper into the most significant workflows and friction points.`;
+          ? `The survey phase should be largely complete. Go deeper into the user's focus area: ${session.focusArea}. Continue toward the full ${ACTION_BUDGET}-action budget.`
+          : `The survey phase should be largely complete. Go deeper into the most significant workflows, gates, and friction points. Continue toward the full ${ACTION_BUDGET}-action budget.`;
       }
 
       const instructions =
@@ -605,9 +760,6 @@ async function runExplorationLoop(session) {
       }
 
       logOpenAIUsage(response, `exploration iteration ${iterations}`);
-
-      // Preserve every model output item before adding the matching tool outputs.
-      // This includes reasoning, messages, computer calls, and function calls.
       conversationItems.push(...(response.output || []));
 
       const responseText = String(response.output_text || "").trim();
@@ -619,8 +771,14 @@ async function runExplorationLoop(session) {
       const toolOutputs = [];
       let hadToolCall = false;
       let stopAfterDeniedSafetyCheck = false;
+      let responseInterruptedByPause = false;
 
       for (const item of response.output || []) {
+        if (session.pauseRequested && !responseInterruptedByPause) {
+          await waitForResumeIfNeeded(session);
+          responseInterruptedByPause = true;
+        }
+
         if (item.type === "computer_call") {
           hadToolCall = true;
 
@@ -630,7 +788,7 @@ async function runExplorationLoop(session) {
 
           let acknowledgedSafetyChecks = [];
 
-          if (pendingSafetyChecks.length > 0) {
+          if (!responseInterruptedByPause && pendingSafetyChecks.length > 0) {
             const description = pendingSafetyChecks
               .map((check) => check.message || check.code || "OpenAI safety check")
               .join(" ");
@@ -663,18 +821,29 @@ async function runExplorationLoop(session) {
             acknowledgedSafetyChecks = pendingSafetyChecks;
           }
 
-          await executeOpenAIComputerActions(session, item.actions);
+          if (!responseInterruptedByPause) {
+            const actionResult =
+              await executeOpenAIComputerActions(session, item.actions);
+
+            if (actionResult.interruptedByPause) {
+              responseInterruptedByPause = true;
+            }
+          }
 
           let screenshotBase64;
           try {
-            screenshotBase64 = await captureOpenAIComputerScreenshot(session.page);
+            screenshotBase64 =
+              await captureOpenAIComputerScreenshot(session.page);
           } catch (err) {
             session.explorationFailed = true;
-            session.explorationError = `Screenshot capture failed after computer action: ${String(err)}`;
+            session.explorationError =
+              `Screenshot capture failed after computer action: ${String(err)}`;
+
             logEvent(session, {
               type: "system",
               text: session.explorationError,
             });
+
             console.error("OpenAI computer screenshot failed:", err);
             session.explorationRunning = false;
             break;
@@ -691,6 +860,7 @@ async function runExplorationLoop(session) {
               ? { acknowledged_safety_checks: acknowledgedSafetyChecks }
               : {}),
           });
+
           continue;
         }
 
@@ -700,8 +870,24 @@ async function runExplorationLoop(session) {
         const args = parseOpenAIFunctionArguments(item);
         let output;
 
-        if (item.name === "record_screen") {
+        if (responseInterruptedByPause) {
+          output =
+            "Skipped because the human paused and may have changed the browser state. Reassess from a fresh screenshot.";
+        } else if (item.name === "record_screen") {
           output = await recordScreen(session, session.page, args);
+        } else if (item.name === "agent_note") {
+          const note = String(args.note || "").trim();
+
+          if (note) {
+            logEvent(session, {
+              type: "agent_note",
+              text: note,
+            });
+          }
+
+          output = note
+            ? "Agent note displayed to the human."
+            : "No note was provided.";
         } else if (item.name === "ask_human") {
           const question = args.question || "What should I do next?";
           logEvent(session, { type: "question", question });
@@ -718,8 +904,11 @@ async function runExplorationLoop(session) {
           output = answer;
         } else if (item.name === "propose_consequential_action") {
           const proposal = {
-            action_description: args.action_description || "Consequential action",
-            reason: args.reason || "This action may have an external effect.",
+            action_description:
+              args.action_description || "Consequential action",
+            reason:
+              args.reason ||
+              "This action may have an external effect.",
           };
 
           logEvent(session, {
@@ -738,6 +927,28 @@ async function runExplorationLoop(session) {
           stopKeepAlive(session);
           logEvent(session, { type: "human_decision", decision });
           output = decision;
+        } else if (item.name === "finish_exploration") {
+          const reason = String(args.reason || "").trim();
+          const coverageSummary =
+            String(args.coverage_summary || "").trim();
+
+          logEvent(session, {
+            type: "agent_note",
+            text:
+              `I’m ending the run before the full action budget because ${reason || "there are no meaningful areas left to explore"}. ` +
+              `${coverageSummary}`.trim(),
+          });
+
+          logEvent(session, {
+            type: "system",
+            text:
+              `Agent ended early at ${session.actionsUsed}/${ACTION_BUDGET} actions: ` +
+              `${reason || "no meaningful areas remained"}`,
+          });
+
+          earlyFinishRequested = true;
+          session.explorationRunning = false;
+          output = "Exploration marked complete.";
         } else {
           output = `Unknown function: ${item.name}`;
         }
@@ -756,34 +967,72 @@ async function runExplorationLoop(session) {
       if (hadToolCall && toolOutputs.length > 0) {
         consecutiveNonToolStops = 0;
         conversationItems.push(...toolOutputs);
+
+        if (responseInterruptedByPause) {
+          conversationItems.push({
+            role: "user",
+            content:
+              "The human paused during the previous response. Some planned actions or function calls were skipped. " +
+              "The returned screenshot reflects the current browser state. Publish a concise agent_note, reassess, and continue from here.",
+          });
+        }
+
+        if (earlyFinishRequested) break;
         continue;
       }
 
       consecutiveNonToolStops++;
 
-      if (consecutiveNonToolStops >= 2 || session.actionsUsed >= ACTION_BUDGET) {
+      if (session.actionsUsed >= ACTION_BUDGET) {
         logEvent(session, { type: "system", text: "Agent finished exploring." });
         break;
       }
 
-      logEvent(session, { type: "system", text: "Agent paused — nudging to continue." });
+      if (consecutiveNonToolStops >= 5) {
+        logEvent(session, {
+          type: "system",
+          text:
+            "Agent stopped making progress after repeated continuation prompts. Ending the exploration safely.",
+        });
+        break;
+      }
+
+      logEvent(session, {
+        type: "system",
+        text:
+          `Agent paused in text with ${ACTION_BUDGET - session.actionsUsed} actions remaining — nudging it to continue.`,
+      });
 
       conversationItems.push({
         role: "user",
-        content: `Continue exploring — ${ACTION_BUDGET - session.actionsUsed} computer actions remain.`,
+        content:
+          `Continue exploring. You still have ${ACTION_BUDGET - session.actionsUsed} computer actions remaining. ` +
+          `Use the full budget unless nothing meaningful remains; in that case call finish_exploration with a concrete reason.`,
       });
+
       appendQueuedSteerMessages(session, conversationItems);
     }
   } catch (err) {
     session.explorationFailed = true;
     session.explorationError = String(err);
+
     logEvent(session, {
       type: "system",
       text: `Exploration crashed: ${session.explorationError}`,
     });
+
     console.error("Exploration loop crashed:", err);
   } finally {
     session.explorationRunning = false;
+    session.pauseRequested = false;
+    session.explorationPaused = false;
+
+    if (session.pauseResumeResolver) {
+      const resolve = session.pauseResumeResolver;
+      session.pauseResumeResolver = null;
+      resolve();
+    }
+
     stopKeepAlive(session);
 
     if (session.explorationFailed) {
@@ -798,6 +1047,7 @@ async function runExplorationLoop(session) {
         type: "system",
         text: `Exploration ended. ${session.screenRecordCount} screens recorded.`,
       });
+
       await generateReport(session);
     }
   }
@@ -807,6 +1057,7 @@ function formatEntry(entry) {
   switch (entry.type) {
     case "action": return `[Action] ${entry.action}`;
     case "agent_text": return `[Observation] ${entry.text}`;
+    case "agent_note": return `[Agent note] ${entry.text}`;
     case "screen_record": return `[SCREEN] ${entry.screen_name}\n  Purpose: ${entry.purpose}\n  Layout: ${entry.layout}\n  Components: ${(entry.components || []).join("; ")}\n  From: ${entry.from_screen || "(start)"} via: ${entry.trigger_action || "n/a"}`;
     case "question": return `[Agent asked] ${entry.question}`;
     case "human_answer": return `[Answered] ${entry.answer}`;
@@ -914,7 +1165,7 @@ function buildJourneyEvidence(
   const observations = session.explorationLog
     .filter(
       (entry) =>
-        entry.type === "agent_text"
+        (entry.type === "agent_text" || entry.type === "agent_note")
         && entry.text
     )
     .slice(-20)
@@ -1680,7 +1931,7 @@ function dashboardHtml(token) {
   <div style="max-width:1500px; margin:0 auto; padding:20px;">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
       <strong>SYNTHETIC_PM</strong>
-      <a href="${WHATSAPP_URL}" target="_blank" style="font-family:monospace; font-size:12px; color:#2f6a4c; text-decoration:none; border:1px solid #2f6a4c; padding:6px 12px; border-radius:999px;">💬 Need help? Message us</a>
+      <a href="${WHATSAPP_URL}" target="_blank" style="font-family:monospace; font-size:12px; color:#2f6a4c; text-decoration:none; border:1px solid #2f6a4c; padding:6px 12px; border-radius:999px;">💬 Need help? Message Bo</a>
     </div>
 
     <div style="display:flex; align-items:center; gap:8px; margin-bottom:16px; font-family:monospace; font-size:12px;">
@@ -1709,22 +1960,46 @@ function dashboardHtml(token) {
       Connecting to a live browser session...
     </div>
 
+    <div id="browser-lag-note" style="display:flex; align-items:flex-start; gap:10px; background:#EEF6FF; border:1px solid #7AA7D9; border-radius:6px; padding:11px 14px; margin-bottom:18px; font-size:13px; line-height:1.45; color:#30465D;">
+      <span aria-hidden="true">ℹ️</span>
+      <div>
+        <strong style="color:#16324D;">The live browser may be a little slow—it’s a real remote browser, not a recording.</strong>
+        Give it a few seconds after each action. If it gets stuck, refresh this page; your remote browser session and agent run will keep going.
+      </div>
+    </div>
+
     <div id="ready-action" style="display:none; margin-bottom:18px;">
       <button onclick="beginExploring()" id="ready-btn" style="width:100%; padding:14px; background:#14181B; color:white; border:none; border-radius:6px; cursor:pointer; font-family:monospace; font-size:14px;">I'm done signing in — start exploring →</button>
     </div>
 
     <div style="display:flex; gap:16px; flex-wrap:wrap;">
       <div style="flex:7; min-width:480px; background:white; border:1px solid #CBD0C4; border-radius:6px; overflow:hidden;">
-        <div style="font-size:11px; padding:8px 14px; border-bottom:1px solid #CBD0C4; color:#5B6259;">LIVE SESSION</div>
+        <div style="font-size:11px; padding:8px 14px; border-bottom:1px solid #CBD0C4; color:#5B6259; display:flex; justify-content:space-between; gap:12px;">
+          <span>LIVE SESSION</span>
+          <span>Remote browser continues if this page is refreshed</span>
+        </div>
         <iframe id="live-frame" style="width:100%; height:75vh; min-height:600px; border:none; display:block;" sandbox="allow-same-origin allow-scripts allow-forms" allow="clipboard-read; clipboard-write"></iframe>
       </div>
-      <div style="flex:3; min-width:300px; display:flex; flex-direction:column; background:white; border:1px solid #CBD0C4; border-radius:6px;">
-        <div style="font-size:11px; padding:8px 14px; border-bottom:1px solid #CBD0C4; color:#5B6259; display:flex; justify-content:space-between; align-items:center;">
+
+      <div style="flex:3; min-width:320px; display:flex; flex-direction:column; background:white; border:1px solid #CBD0C4; border-radius:6px;">
+        <div style="font-size:11px; min-height:48px; padding:8px 14px; border-bottom:1px solid #CBD0C4; color:#5B6259; display:flex; justify-content:space-between; align-items:center; gap:8px;">
           <span>LOG</span>
-          <span id="status-badge" style="display:none; font-family:monospace; font-size:11px; padding:3px 10px; border-radius:999px;"></span>
+
+          <div style="display:flex; align-items:center; justify-content:flex-end; gap:7px; flex-wrap:wrap;">
+            <span id="budget-badge" style="display:none; font-family:monospace; font-size:11px; padding:3px 9px; border-radius:999px; color:#4B5563; background:#F2F4EF; border:1px solid #CBD0C4;">0 / ${ACTION_BUDGET} actions</span>
+            <span id="status-badge" style="display:none; font-family:monospace; font-size:11px; padding:3px 10px; border-radius:999px;"></span>
+            <button id="pause-btn" onclick="togglePause()" type="button" style="display:none; width:auto; min-width:112px; height:32px; padding:0 12px; margin:0; border:1px solid #243241; border-radius:4px; background:white; color:#243241; font-family:monospace; font-size:11px; cursor:pointer;">⏸ Pause agent</button>
+          </div>
         </div>
+
         <div id="log-entries" style="flex:1; overflow-y:auto; padding:10px 14px; font-size:13px; max-height:75vh;"></div>
+
         <div id="pending-container"></div>
+
+        <div id="paused-strip" style="display:none; padding:10px 14px; border-top:1px solid #B7D6C7; background:#ECF8F1; color:#24543E; font-size:12px; line-height:1.45;">
+          The agent is paused. You can use the embedded browser manually, send a steering note, or refresh this page. Click <strong>Resume agent</strong> when ready.
+        </div>
+
         <div id="steer-row" style="padding:10px 14px; border-top:1px solid #CBD0C4; display:flex; align-items:center; gap:8px;">
           <input id="steer-input" placeholder="Tell the agent what to focus on..." style="flex:1 1 auto; min-width:0; width:auto; height:38px; line-height:38px; margin:0; padding:0 10px; border:1px solid #CBD0C4; border-radius:4px; box-sizing:border-box; font-size:13px; font-family:inherit; vertical-align:middle; display:block;" />
           <button onclick="sendSteer()" style="flex:0 0 auto; width:auto; height:38px; line-height:38px; margin:0; padding:0 16px; background:#2f6a4c; color:white; border:none; border-radius:4px; cursor:pointer; white-space:nowrap; font-family:monospace; font-size:13px; vertical-align:middle; display:block;">Send</button>
@@ -1738,25 +2013,38 @@ function dashboardHtml(token) {
       <pre id="report-text" style="white-space:pre-wrap; font-family:monospace; font-size:13px; max-height:500px; overflow-y:auto;"></pre>
     </div>
   </div>
+
   <style>
-    #steer-input:focus { outline: 2px solid #E8502B; outline-offset: -1px; }
+    #steer-input:focus {
+      outline:2px solid #E8502B;
+      outline-offset:-1px;
+    }
+
+    #pause-btn:hover {
+      background:#F4F6F2;
+    }
   </style>
+
   <script>
     const token = "${token}";
     let renderedCount = 0;
     let lastPendingSig = null;
     let knownTabIds = [];
     let selectedIndex = 0;
+    let pauseRequestedOrActive = false;
 
     function setStep(n, instructionHtml) {
       document.querySelectorAll('.step-item').forEach(el => {
         const step = parseInt(el.dataset.step);
         const circle = el.querySelector('.step-circle');
-        if (step === n) { circle.style.background = '#E8502B'; }
-        else if (step < n) { circle.style.background = '#2f6a4c'; }
-        else { circle.style.background = '#CBD0C4'; }
+
+        if (step === n) circle.style.background = '#E8502B';
+        else if (step < n) circle.style.background = '#2f6a4c';
+        else circle.style.background = '#CBD0C4';
       });
+
       const banner = document.getElementById('instruction-banner');
+
       if (!instructionHtml) {
         banner.style.display = 'none';
       } else {
@@ -1765,33 +2053,162 @@ function dashboardHtml(token) {
       }
     }
 
-    async function connectSession() {
-      const res = await fetch('/session-begin?token=' + token, { method: 'POST' });
-      if (!res.ok) {
-        setStep(1, '⚠️ Could not start a session — it may already be used, or something went wrong. Message us on WhatsApp if this persists.');
+    function setStatus(text, background, color) {
+      const badge = document.getElementById('status-badge');
+      badge.style.display = 'inline-block';
+      badge.textContent = text;
+      badge.style.background = background;
+      badge.style.color = color;
+    }
+
+    function updatePauseUi(data) {
+      const button = document.getElementById('pause-btn');
+      const strip = document.getElementById('paused-strip');
+      const budget = document.getElementById('budget-badge');
+
+      budget.style.display = 'inline-block';
+      budget.textContent = (data.actionsUsed || 0) + ' / ' + (data.actionBudget || ${ACTION_BUDGET}) + ' actions';
+
+      pauseRequestedOrActive =
+        Boolean(data.paused || data.pauseRequested);
+
+      if (data.paused) {
+        button.style.display = 'inline-block';
+        button.textContent = '▶ Resume agent';
+        button.style.background = '#2F6A4C';
+        button.style.borderColor = '#2F6A4C';
+        button.style.color = 'white';
+        strip.style.display = 'block';
+        setStatus('Paused by you', '#ECF8F1', '#2F6A4C');
         return;
       }
-      setStep(2, '👉 Type the product\\'s URL into the address bar below, then sign in. Once you\\'re ready, confirm below and let Synthetic PM take over.');
+
+      if (data.pauseRequested) {
+        button.style.display = 'inline-block';
+        button.textContent = '▶ Resume agent';
+        button.style.background = '#2F6A4C';
+        button.style.borderColor = '#2F6A4C';
+        button.style.color = 'white';
+        strip.style.display = 'block';
+        setStatus('Pausing…', '#ECF8F1', '#2F6A4C');
+        return;
+      }
+
+      strip.style.display = 'none';
+      button.textContent = '⏸ Pause agent';
+      button.style.background = 'white';
+      button.style.borderColor = '#243241';
+      button.style.color = '#243241';
+
+      if (data.running) {
+        button.style.display = 'inline-block';
+        setStatus('⏳ Exploring…', '#fef3c7', '#b45309');
+      } else {
+        button.style.display = 'none';
+      }
+    }
+
+    async function connectSession() {
+      const res = await fetch('/session-begin?token=' + token, {
+        method: 'POST'
+      });
+
+      if (!res.ok) {
+        setStep(
+          1,
+          '⚠️ Could not start a session — it may already be used, or something went wrong. Message Bo on WhatsApp if this persists.'
+        );
+        return;
+      }
+
+      let state = null;
+
+      try {
+        const stateRes =
+          await fetch('/session-log?token=' + token);
+
+        if (stateRes.ok) state = await stateRes.json();
+      } catch (err) {}
+
+      const existingRun =
+        state &&
+        (
+          state.running ||
+          state.paused ||
+          state.pauseRequested ||
+          state.report ||
+          state.failed ||
+          state.reportGenerating ||
+          state.actionsUsed > 0
+        );
+
+      if (existingRun) {
+        document.getElementById('ready-action').style.display = 'none';
+
+        if (state.report) {
+          setStep(
+            4,
+            '✅ Done! The report has been delivered to your email.'
+          );
+        } else if (state.failed) {
+          setStep(
+            3,
+            '⚠️ The exploration stopped because the AI service returned an error. No report was generated. Please try again or message Bo on WhatsApp.'
+          );
+        } else if (state.reportGenerating) {
+          setStep(
+            4,
+            '📝 Exploration complete. Synthetic PM is preparing your report.'
+          );
+        } else {
+          setStep(
+            3,
+            '🔎 Synthetic PM is exploring — you can steer it anytime, and it may ask for input or approval.'
+          );
+        }
+
+        updatePauseUi(state);
+        pollTabs();
+        return;
+      }
+
+      setStep(
+        2,
+        '👉 Type the product\\'s URL into the address bar below, then sign in. Once you\\'re ready, confirm below and let Synthetic PM take over.'
+      );
+
       document.getElementById('ready-action').style.display = 'block';
       pollTabs();
     }
 
     async function beginExploring() {
       document.getElementById('ready-action').style.display = 'none';
-      await fetch('/session-phase?token=' + token, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({phase:2}) });
-      const badge = document.getElementById('status-badge');
-      badge.style.display = 'inline-block';
-      badge.textContent = '⏳ Exploring...';
-      badge.style.background = '#fef3c7';
-      badge.style.color = '#b45309';
-      setStep(3, '🔎 Synthetic PM is exploring — you can steer it anytime, and it may ask for input or approval.');
-      await fetch('/session-start?token=' + token, { method: 'POST' });
+
+      await fetch('/session-phase?token=' + token, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({phase:2})
+      });
+
+      document.getElementById('pause-btn').style.display = 'inline-block';
+      document.getElementById('budget-badge').style.display = 'inline-block';
+      setStatus('⏳ Exploring…', '#fef3c7', '#b45309');
+
+      setStep(
+        3,
+        '🔎 Synthetic PM is exploring — you can steer it anytime, and it may ask for input or approval.'
+      );
+
+      await fetch('/session-start?token=' + token, {
+        method: 'POST'
+      });
     }
 
     function labelFor(e) {
       switch(e.type) {
         case 'action': return 'ACTION: ' + e.action;
         case 'agent_text': return e.text;
+        case 'agent_note': return e.text;
         case 'screen_record': return 'SCREEN: ' + e.screen_name;
         case 'question': return 'AGENT ASKS: ' + e.question;
         case 'confirmation_request': return 'AGENT PROPOSES: ' + e.description;
@@ -1802,155 +2219,292 @@ function dashboardHtml(token) {
         default: return '';
       }
     }
+
+    function appendLogEntry(entry, wrapper) {
+      const div = document.createElement('div');
+
+      if (entry.type === 'agent_note') {
+        div.style.margin = '8px 0';
+        div.style.padding = '10px 11px';
+        div.style.background = '#F3F0FF';
+        div.style.border = '1px solid #D8CFF2';
+        div.style.borderLeft = '4px solid #8B73C7';
+        div.style.borderRadius = '5px';
+        div.style.lineHeight = '1.45';
+
+        const label = document.createElement('div');
+        label.textContent = 'AGENT NOTE';
+        label.style.fontFamily = 'monospace';
+        label.style.fontSize = '10px';
+        label.style.fontWeight = '700';
+        label.style.letterSpacing = '0.04em';
+        label.style.color = '#665199';
+        label.style.marginBottom = '4px';
+
+        const body = document.createElement('div');
+        body.textContent = entry.text || '';
+
+        div.appendChild(label);
+        div.appendChild(body);
+      } else {
+        div.style.padding = '5px 0';
+        div.style.borderBottom = '1px solid #eee';
+        div.textContent = labelFor(entry);
+      }
+
+      wrapper.appendChild(div);
+    }
+
     async function pollLog() {
       const res =
-        await fetch(
-          '/session-log?token='
-          + token
-        );
+        await fetch('/session-log?token=' + token);
 
-      const data =
-        await res.json();
+      if (!res.ok) return;
 
+      const data = await res.json();
       const wrapper =
-        document.getElementById(
-          'log-entries'
-        );
+        document.getElementById('log-entries');
 
       for (
         let i = renderedCount;
         i < data.log.length;
         i++
       ) {
-        const div =
-          document.createElement(
-            'div'
-          );
-
-        div.style.padding =
-          '5px 0';
-
-        div.style.borderBottom =
-          '1px solid #eee';
-
-        div.textContent =
-          labelFor(
-            data.log[i]
-          );
-
-        wrapper.appendChild(
-          div
-        );
+        appendLogEntry(data.log[i], wrapper);
       }
 
-      renderedCount =
-        data.log.length;
-
-      wrapper.scrollTop =
-        wrapper.scrollHeight;
+      renderedCount = data.log.length;
+      wrapper.scrollTop = wrapper.scrollHeight;
+      updatePauseUi(data);
 
       if (data.failed) {
         setStep(
           3,
-          '⚠️ The exploration stopped because the AI service returned an error. No report was generated. Please try again or message us on WhatsApp.'
+          '⚠️ The exploration stopped because the AI service returned an error. No report was generated. Please try again or message Bo on WhatsApp.'
         );
 
-        const badge = document.getElementById('status-badge');
-        badge.style.display = 'inline-block';
-        badge.textContent = 'Exploration failed';
-        badge.style.background = '#fee2e2';
-        badge.style.color = '#991b1b';
+        setStatus(
+          'Exploration failed',
+          '#fee2e2',
+          '#991b1b'
+        );
 
-        document
-          .getElementById(
-            'report-panel'
-          )
-          .style.display =
-            'none';
+        document.getElementById('pause-btn').style.display = 'none';
+        document.getElementById('paused-strip').style.display = 'none';
+        document.getElementById('report-panel').style.display = 'none';
       } else if (data.report) {
         setStep(
           4,
           '✅ Done! The report has been delivered to your email.'
         );
 
-        const badge = document.getElementById('status-badge');
-        badge.style.display = 'inline-block';
-        badge.textContent = '✓ Exploration complete';
-        badge.style.background = '#dcfce7';
-        badge.style.color = '#2f6a4c';
+        setStatus(
+          '✓ Exploration complete',
+          '#dcfce7',
+          '#2f6a4c'
+        );
 
-        document
-          .getElementById(
-            'report-panel'
-          )
-          .style.display =
-            'block';
+        document.getElementById('pause-btn').style.display = 'none';
+        document.getElementById('paused-strip').style.display = 'none';
+        document.getElementById('report-panel').style.display = 'block';
+        document.getElementById('report-text').textContent = data.report;
+      } else if (
+        !data.running &&
+        data.reportGenerating
+      ) {
+        setStep(
+          4,
+          '📝 Exploration complete. Synthetic PM is preparing your report.'
+        );
 
-        document
-          .getElementById(
-            'report-text'
-          )
-          .textContent =
-            data.report;
+        setStatus(
+          'Preparing report…',
+          '#EEF6FF',
+          '#30465D'
+        );
+
+        document.getElementById('pause-btn').style.display = 'none';
+        document.getElementById('paused-strip').style.display = 'none';
+      }
+    }
+
+    async function togglePause() {
+      const endpoint =
+        pauseRequestedOrActive
+          ? '/session-resume'
+          : '/session-pause';
+
+      const button = document.getElementById('pause-btn');
+      button.disabled = true;
+
+      try {
+        const res = await fetch(endpoint + '?token=' + token, {
+          method: 'POST'
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          pauseRequestedOrActive =
+            Boolean(data.paused || data.pauseRequested);
+
+          if (pauseRequestedOrActive) {
+            button.textContent = '▶ Resume agent';
+            button.style.background = '#2F6A4C';
+            button.style.borderColor = '#2F6A4C';
+            button.style.color = 'white';
+            document.getElementById('paused-strip').style.display = 'block';
+            setStatus('Pausing…', '#ECF8F1', '#2F6A4C');
+          } else {
+            button.textContent = '⏸ Pause agent';
+            button.style.background = 'white';
+            button.style.borderColor = '#243241';
+            button.style.color = '#243241';
+            document.getElementById('paused-strip').style.display = 'none';
+            setStatus('⏳ Exploring…', '#fef3c7', '#b45309');
+          }
+        }
+      } finally {
+        button.disabled = false;
       }
     }
 
     async function pollPending() {
-      const res = await fetch('/session-pending?token=' + token);
+      const res =
+        await fetch('/session-pending?token=' + token);
+
       const pending = await res.json();
-      const sig = pending ? pending.type + JSON.stringify(pending.content) : null;
+      const sig =
+        pending
+          ? pending.type + JSON.stringify(pending.content)
+          : null;
+
       if (sig === lastPendingSig) return;
       lastPendingSig = sig;
-      const c = document.getElementById('pending-container');
+
+      const c =
+        document.getElementById('pending-container');
+
       c.innerHTML = '';
+
       if (!pending) return;
+
       const div = document.createElement('div');
-      div.style.cssText = 'padding:12px 14px; border-top:2px solid #b45309; background:#fef3c7;';
+      div.style.cssText =
+        'padding:12px 14px; border-top:2px solid #b45309; background:#fef3c7;';
+
       if (pending.type === 'question') {
-        div.innerHTML = '<p><strong>Agent asks:</strong> ' + pending.content + '</p><input id="ans" style="width:100%;padding:8px;margin-bottom:8px;box-sizing:border-box;"><button onclick="sendAnswer()" style="width:100%;padding:8px;">Send</button>';
+        div.innerHTML =
+          '<p><strong>Agent asks:</strong> ' +
+          pending.content +
+          '</p><input id="ans" style="width:100%;padding:8px;margin-bottom:8px;box-sizing:border-box;">' +
+          '<button onclick="sendAnswer()" style="width:100%;padding:8px;">Send</button>';
       } else {
-        div.innerHTML = '<p><strong>Agent proposes:</strong> ' + pending.content.action_description + '<br><em>' + pending.content.reason + '</em></p><button onclick="sendDecision(true)" style="width:100%;padding:8px;background:#2f6a4c;color:white;border:none;border-radius:4px;margin-bottom:6px;">Approve</button><button onclick="sendDecision(false)" style="width:100%;padding:8px;background:#9a3b26;color:white;border:none;border-radius:4px;">Deny</button>';
+        div.innerHTML =
+          '<p><strong>Agent proposes:</strong> ' +
+          pending.content.action_description +
+          '<br><em>' +
+          pending.content.reason +
+          '</em></p>' +
+          '<button onclick="sendDecision(true)" style="width:100%;padding:8px;background:#2f6a4c;color:white;border:none;border-radius:4px;margin-bottom:6px;">Approve</button>' +
+          '<button onclick="sendDecision(false)" style="width:100%;padding:8px;background:#9a3b26;color:white;border:none;border-radius:4px;">Deny</button>';
       }
+
       c.appendChild(div);
     }
 
     async function sendAnswer() {
-      const v = document.getElementById('ans').value.trim();
+      const v =
+        document.getElementById('ans').value.trim();
+
       if (!v) return;
-      await fetch('/session-answer?token=' + token, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({answer:v}) });
+
+      await fetch('/session-answer?token=' + token, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({answer:v})
+      });
     }
 
     async function sendDecision(approved) {
-      await fetch('/session-answer?token=' + token, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({answer: approved ? 'Approved by user.' : 'Denied by user.'}) });
+      await fetch('/session-answer?token=' + token, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          answer:
+            approved
+              ? 'Approved by user.'
+              : 'Denied by user.'
+        })
+      });
     }
 
     async function sendSteer() {
-      const input = document.getElementById('steer-input');
+      const input =
+        document.getElementById('steer-input');
+
       const text = input.value.trim();
+
       if (!text) return;
-      await fetch('/session-steer?token=' + token, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text }) });
+
+      await fetch('/session-steer?token=' + token, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ text })
+      });
+
       input.value = '';
     }
-    document.getElementById('steer-input').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') sendSteer();
-    });
+
+    document
+      .getElementById('steer-input')
+      .addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') sendSteer();
+      });
 
     async function pollTabs() {
       try {
-        const res = await fetch('/session-tabs?token=' + token);
+        const res =
+          await fetch('/session-tabs?token=' + token);
+
         const tabs = await res.json();
+
         if (!Array.isArray(tabs) || tabs.length === 0) return;
-        if (tabs.length > knownTabIds.length && knownTabIds.length > 0) selectedIndex = tabs.length - 1;
-        knownTabIds = tabs.map((t,i)=>t.id||i);
-        const frame = document.getElementById('live-frame');
-        const url = tabs[Math.min(selectedIndex, tabs.length-1)].debuggerFullscreenUrl;
-        if (frame.dataset.current !== url) { frame.src = url; frame.dataset.current = url; }
+
+        if (
+          tabs.length > knownTabIds.length &&
+          knownTabIds.length > 0
+        ) {
+          selectedIndex = tabs.length - 1;
+        }
+
+        knownTabIds =
+          tabs.map((t, i) => t.id || i);
+
+        const frame =
+          document.getElementById('live-frame');
+
+        const url =
+          tabs[
+            Math.min(
+              selectedIndex,
+              tabs.length - 1
+            )
+          ].debuggerFullscreenUrl;
+
+        if (frame.dataset.current !== url) {
+          frame.src = url;
+          frame.dataset.current = url;
+        }
       } catch(e) {}
     }
 
     connectSession();
-    pollLog(); pollPending();
-    setInterval(pollLog, 1500); setInterval(pollPending, 1500); setInterval(pollTabs, 2000);
+    pollLog();
+    pollPending();
+
+    setInterval(pollLog, 1500);
+    setInterval(pollPending, 1500);
+    setInterval(pollTabs, 2000);
   </script>
   `);
 }
@@ -2225,6 +2779,41 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/session-pause" && req.method === "POST") {
+    if (!session) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "session_not_found" }));
+      return;
+    }
+
+    const result = requestExplorationPause(session);
+
+    res.writeHead(
+      result.accepted ? 200 : 409,
+      { "Content-Type": "application/json" }
+    );
+
+    res.end(JSON.stringify(result));
+    return;
+  }
+
+  if (url.pathname === "/session-resume" && req.method === "POST") {
+    if (!session) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "session_not_found" }));
+      return;
+    }
+
+    const result = resumeExploration(session);
+
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+    });
+
+    res.end(JSON.stringify(result));
+    return;
+  }
+
   if (url.pathname === "/session-log" && req.method === "GET") {
     if (!session) { res.writeHead(404); res.end("{}"); return; }
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -2235,6 +2824,11 @@ const server = createServer(async (req, res) => {
       report: session.report,
       failed: session.explorationFailed,
       error: session.explorationError,
+      paused: session.explorationPaused,
+      pauseRequested: session.pauseRequested,
+      actionBudget: ACTION_BUDGET,
+      phase: session.phase,
+      reportGenerating: session.reportGenerating,
     }));
     return;
   }
