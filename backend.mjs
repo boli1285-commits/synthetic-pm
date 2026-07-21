@@ -3123,33 +3123,33 @@ const server = createServer(async (req, res) => {
       <h1>Synthetic PM: Your product intel wingman</h1>
       <p>Point it at a product — it maps the real user journey.</p>
       <ul style="text-align:left; color:#5B6259; font-size:14px; line-height:1.6; padding-left:20px; margin:0 0 20px;">
-        <li>Use a real email — your access link and final report both go there</li>
-        <li>1 free exploration per verified email</li>
-        <li>Free trial includes 30 agent actions — usually enough for 2–5 product areas</li>
-        <li>Create the target account first so the agent can start exploring right away</li>
+        <li>Use a real email for access and reports.</li>
+        <li>1 free exploration per verified email.</li>
+        <li>30 exploration credits per trial.</li>
+        <li>Create the product account before starting.</li>
       </ul>
       <form method="POST" action="/signup">
-        <label>Name</label>
+        <label>Name <span aria-hidden="true">*</span></label>
         <input type="text" name="name" placeholder="Jane Doe" required />
-        <label>Work email</label>
+        <label>Work email <span aria-hidden="true">*</span></label>
         <input type="email" name="email" placeholder="you@company.com" required />
-        <label>Your role</label>
+        <label>Your role <span aria-hidden="true">*</span></label>
         <select name="role" required>
           <option value="" disabled selected>Select one</option>
           <option>Product Owner</option>
           <option>Designer</option>
           <option>Something else</option>
         </select>
-        <label>Whose product do you want to explore?</label>
+        <label>Whose product do you want to explore? <span aria-hidden="true">*</span></label>
         <select name="product_ownership" required>
           <option value="" disabled selected>Select one</option>
           <option>My own product</option>
           <option>A competitor's product</option>
         </select>
-        <label>What's the product URL?</label>
+        <label>What's the product URL? <span aria-hidden="true">*</span></label>
         <input type="text" name="target_product" placeholder="https://example.com" required />
         <label>What do you want Synthetic PM to focus on? (optional)</label>
-        <textarea name="focus_area" rows="2" placeholder="e.g. onboarding flow, pricing page"></textarea>
+        <textarea name="focus_area" rows="2" placeholder="e.g. pricing page, profiles, settings"></textarea>
         <label>Your WhatsApp / phone number (optional)</label>
         <input type="tel" name="whatsapp" placeholder="+1 234 567 8900" />
         <button type="submit">Send confirmation link</button>
@@ -3164,17 +3164,41 @@ const server = createServer(async (req, res) => {
     req.on("end", async () => {
       const params = new URLSearchParams(body);
       const email = normalizeEmail(params.get("email"));
-      const targetProduct = params.get("target_product");
-      const name = params.get("name") || "";
-      const role = params.get("role") || "";
-      const ownership = params.get("product_ownership") || "";
-      const focusArea = params.get("focus_area") || "";
-      const whatsapp = params.get("whatsapp") || "";
+      const targetProduct = String(params.get("target_product") || "").trim();
+      const name = String(params.get("name") || "").trim();
+      const role = String(params.get("role") || "").trim();
+      const ownership = String(params.get("product_ownership") || "").trim();
+      const focusArea = String(params.get("focus_area") || "").trim();
+      const whatsapp = String(params.get("whatsapp") || "").trim();
       const ip = getClientIp(req);
 
-      if (!email || !targetProduct) {
+      const allowedRoles = new Set([
+        "Product Owner",
+        "Designer",
+        "Something else",
+      ]);
+
+      const allowedOwnership = new Set([
+        "My own product",
+        "A competitor's product",
+      ]);
+
+      if (
+        !name ||
+        !email ||
+        !role ||
+        !ownership ||
+        !targetProduct ||
+        !allowedRoles.has(role) ||
+        !allowedOwnership.has(ownership)
+      ) {
         res.writeHead(400, { "Content-Type": "text/html" });
-        res.end(page("Missing info", `<div class="card-wrap"><div class="card"><h1>Missing info</h1><p>Please fill in the required fields.</p></div></div>`));
+        res.end(
+          page(
+            "Missing info",
+            `<div class="card-wrap"><div class="card"><h1>Missing info</h1><p>Please complete all required questions.</p><p><a href="/start">Return to the questionnaire</a></p></div></div>`
+          )
+        );
         return;
       }
 
