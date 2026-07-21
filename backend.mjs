@@ -135,6 +135,8 @@ function createSessionState(token, data) {
     pendingSteerMessages: [],
     actionsUsed: 0,
     explorationRunning: false,
+    explorationFailed: false,
+    explorationError: null,
     keepAliveTimer: null,
     lastScreenName: null,
     lastActionSummary: null,
@@ -521,14 +523,24 @@ function logOpenAIUsage(response, label) {
 
 async function runExplorationLoop(session) {
   session.explorationRunning = true;
+  session.explorationFailed = false;
+  session.explorationError = null;
+  session.report = null;
 
   let iterations = 0;
   let consecutiveNonToolStops = 0;
-  let previousResponseId = null;
 
-  let nextInput = session.focusArea
+  const startText = session.focusArea
     ? `Begin exploring ${session.targetProduct}. Start with a broad survey of the main navigation areas. The user specifically wants you to go deep on "${session.focusArea}" after the survey. First inspect the current screen with the computer tool, then record the starting screen.`
     : `Begin exploring ${session.targetProduct}. Start with a broad survey of the main navigation areas before going deep into any single workflow. First inspect the current screen with the computer tool, then record the starting screen.`;
+
+  // We deliberately manage conversation history ourselves instead of relying on
+  // previous_response_id. The first computer-use request was succeeding while the
+  // stateful continuation was receiving an erroneous model-access response.
+  const conversationItems = [{
+    role: "user",
+    content: startText,
+  }];
 
   try {
     while (session.explorationRunning) {
@@ -579,17 +591,24 @@ async function runExplorationLoop(session) {
           instructions,
           tools: OPENAI_EXPLORATION_TOOLS,
           parallel_tool_calls: false,
-          input: nextInput,
-          ...(previousResponseId ? { previous_response_id: previousResponseId } : {}),
+          input: conversationItems,
         });
       } catch (err) {
-        logEvent(session, { type: "system", text: `OpenAI API call failed: ${String(err)}` });
+        session.explorationFailed = true;
+        session.explorationError = String(err);
+        logEvent(session, {
+          type: "system",
+          text: `OpenAI API call failed: ${session.explorationError}`,
+        });
         console.error("OpenAI exploration call failed:", err);
         break;
       }
 
-      previousResponseId = response.id;
       logOpenAIUsage(response, `exploration iteration ${iterations}`);
+
+      // Preserve every model output item before adding the matching tool outputs.
+      // This includes reasoning, messages, computer calls, and function calls.
+      conversationItems.push(...(response.output || []));
 
       const responseText = String(response.output_text || "").trim();
       if (responseText) {
@@ -650,9 +669,11 @@ async function runExplorationLoop(session) {
           try {
             screenshotBase64 = await captureOpenAIComputerScreenshot(session.page);
           } catch (err) {
+            session.explorationFailed = true;
+            session.explorationError = `Screenshot capture failed after computer action: ${String(err)}`;
             logEvent(session, {
               type: "system",
-              text: `Screenshot capture failed after computer action: ${String(err)}`,
+              text: session.explorationError,
             });
             console.error("OpenAI computer screenshot failed:", err);
             session.explorationRunning = false;
@@ -665,7 +686,6 @@ async function runExplorationLoop(session) {
             output: {
               type: "computer_screenshot",
               image_url: `data:image/jpeg;base64,${screenshotBase64}`,
-              detail: "original",
             },
             ...(acknowledgedSafetyChecks.length > 0
               ? { acknowledged_safety_checks: acknowledgedSafetyChecks }
@@ -729,13 +749,13 @@ async function runExplorationLoop(session) {
         });
       }
 
-      if (stopAfterDeniedSafetyCheck) break;
+      if (session.explorationFailed || stopAfterDeniedSafetyCheck) break;
 
       appendQueuedSteerMessages(session, toolOutputs);
 
       if (hadToolCall && toolOutputs.length > 0) {
         consecutiveNonToolStops = 0;
-        nextInput = toolOutputs;
+        conversationItems.push(...toolOutputs);
         continue;
       }
 
@@ -748,23 +768,38 @@ async function runExplorationLoop(session) {
 
       logEvent(session, { type: "system", text: "Agent paused — nudging to continue." });
 
-      nextInput = [{
+      conversationItems.push({
         role: "user",
         content: `Continue exploring — ${ACTION_BUDGET - session.actionsUsed} computer actions remain.`,
-      }];
-      appendQueuedSteerMessages(session, nextInput);
+      });
+      appendQueuedSteerMessages(session, conversationItems);
     }
   } catch (err) {
-    logEvent(session, { type: "system", text: `Exploration crashed: ${String(err)}` });
+    session.explorationFailed = true;
+    session.explorationError = String(err);
+    logEvent(session, {
+      type: "system",
+      text: `Exploration crashed: ${session.explorationError}`,
+    });
     console.error("Exploration loop crashed:", err);
   } finally {
     session.explorationRunning = false;
     stopKeepAlive(session);
-    logEvent(session, {
-      type: "system",
-      text: `Exploration ended. ${session.screenRecordCount} screens recorded.`,
-    });
-    await generateReport(session);
+
+    if (session.explorationFailed) {
+      logEvent(session, {
+        type: "system",
+        text:
+          `Exploration failed after recording ${session.screenRecordCount} screen(s). ` +
+          `No report was generated.`,
+      });
+    } else {
+      logEvent(session, {
+        type: "system",
+        text: `Exploration ended. ${session.screenRecordCount} screens recorded.`,
+      });
+      await generateReport(session);
+    }
   }
 }
 
@@ -1814,7 +1849,25 @@ function dashboardHtml(token) {
       wrapper.scrollTop =
         wrapper.scrollHeight;
 
-      if (data.report) {
+      if (data.failed) {
+        setStep(
+          3,
+          '⚠️ The exploration stopped because the AI service returned an error. No report was generated. Please try again or message us on WhatsApp.'
+        );
+
+        const badge = document.getElementById('status-badge');
+        badge.style.display = 'inline-block';
+        badge.textContent = 'Exploration failed';
+        badge.style.background = '#fee2e2';
+        badge.style.color = '#991b1b';
+
+        document
+          .getElementById(
+            'report-panel'
+          )
+          .style.display =
+            'none';
+      } else if (data.report) {
         setStep(
           4,
           '✅ Done! The report has been delivered to your email.'
@@ -1927,10 +1980,10 @@ const server = createServer(async (req, res) => {
       <h1>Synthetic PM: Your product intel wingman</h1>
       <p>Point it at a product — it maps the real user journey.</p>
       <ul style="text-align:left; color:#5B6259; font-size:14px; line-height:1.6; padding-left:20px; margin:0 0 20px;">
-        <li>Use work email — you will find access URL & report</li>
+        <li>Use a real email — your access link and final report both go there</li>
         <li>1 free exploration per verified email</li>
-        <li>Free trial caps at 30 actions — 2–5 sections</li>
-        <li>Register beforehand — session time is billed either way</li>
+        <li>Free trial includes 30 agent actions — usually enough for 2–5 product areas</li>
+        <li>Create the target account first so the agent can start exploring right away</li>
       </ul>
       <form method="POST" action="/signup">
         <label>Name</label>
@@ -2175,7 +2228,14 @@ const server = createServer(async (req, res) => {
   if (url.pathname === "/session-log" && req.method === "GET") {
     if (!session) { res.writeHead(404); res.end("{}"); return; }
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ log: session.explorationLog, running: session.explorationRunning, actionsUsed: session.actionsUsed, report: session.report }));
+    res.end(JSON.stringify({
+      log: session.explorationLog,
+      running: session.explorationRunning,
+      actionsUsed: session.actionsUsed,
+      report: session.report,
+      failed: session.explorationFailed,
+      error: session.explorationError,
+    }));
     return;
   }
 
